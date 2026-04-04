@@ -1,3 +1,6 @@
+# yamcs items
+yamcs-data/
+
 # fprime items
 logs/
 cmake-build-*
