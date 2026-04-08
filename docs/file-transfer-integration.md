@@ -618,12 +618,12 @@ is a specific bug worth pinning with a fast in-CI regression test.
 
 ## Open questions
 
-- Does the team have prior experience writing YAMCS Java plugins, or is this
-  the first one? If first, budget extra time for the YAMCS plugin build/load
-  cycle.
-- For uplink, what is the operator-facing trigger? A YAMCS command? A bucket
-  drop? An HTTP API call? This should be decided with whoever will operate
-  the system.
+- Java plugin authoring is accepted as a cost worth paying — it unlocks
+  YAMCS as the primary ground system. First-plugin friction (build/load
+  cycle, packaging) should be expected.
+- For uplink, what is the operator-facing trigger? A YAMCS command? A
+  bucket drop? An HTTP API call? Recommend U1 (command) per the Vision
+  section, but final call belongs to whoever will operate the system.
 - How should partial transfers be surfaced to operators (timeouts, missing
   packets, checksum failures)? Probably YAMCS events plus an alarm channel.
 
