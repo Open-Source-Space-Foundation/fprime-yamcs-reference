@@ -593,6 +593,28 @@ is a specific bug worth pinning with a fast in-CI regression test.
   match `Fw::ComPacketType` exactly (see `ApidManager.hpp:21-31`), so the
   CCSDS APID *is* the F´ packet-type discriminator. No room for the
   outer and inner discriminators to disagree.
+- **XTCE dictionary direction is `Fw::FilePacket`, not CFDP.** Verified by
+  reading `fprime.xtce.xml` directly. The dictionary follows a clear
+  pattern of one abstract `SequenceContainer` per F´ APID, gating on
+  `CCSDS_Packet_ID/APID`:
+
+  | Container               | APID | Status        |
+  | ----------------------- | ---- | ------------- |
+  | (commands, line 2573)   | 0    | present       |
+  | `FPrimeTelemetryChannel`| 1    | present       |
+  | `FPrimeEvent`           | 2    | present       |
+  | **(file packets)**      | **3**| **missing — the gap** |
+  | `FPrimeTelemetryPacket` | 4    | present       |
+
+  There are **zero** CFDP-related entries anywhere in the dictionary
+  (`grep -i cfdp` → 0 hits), and no `cfdp_in`/`cfdp_out` streams in the
+  YAMCS config. The CFDP path was never started. The only direction
+  consistent with the existing dictionary structure is to add an
+  `FPrimeFilePacket` abstract container gated on APID 3, with concrete
+  Start/Data/End/Cancel children gated further on the `Fw::FilePacket`
+  header type field. This is a copy-paste-modify of the existing
+  `FPrimeEvent` block (the simplest existing container) plus payload
+  entries — no novel XTCE machinery needed.
 
 ## Open questions
 
