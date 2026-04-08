@@ -249,6 +249,137 @@ is already producing.
 | Approximate code footprint               | 0             | ~300+ lines   | ~150 lines   |
 | Implementation language                  | n/a           | Python        | Java         |
 
+## Vision: operator workflow under Option C
+
+This section walks through what file transfer actually *looks like* to a
+YAMCS operator once Option C is in place. It is not a protocol spec — see
+the wire format reference and Option C behavior sections above for that.
+
+### Downlink (spacecraft → operator)
+
+**Goal:** retrieve `/sd0/log_2026-04-08.bin` from the spacecraft.
+
+1. Operator issues a normal F´ command from the YAMCS command stack:
+   `FileDownlink.SendFile("/sd0/log_2026-04-08.bin",
+   "downlinks/log_2026-04-08.bin")`. This already works today — it is a
+   standard F´ command in the existing XTCE dictionary.
+2. Spacecraft `FileDownlink` chops the file into `Fw::FilePacket`s
+   (Start, Data×N, End) and emits them as CCSDS packets on the file APID
+   over the existing TM UDP link.
+3. YAMCS UDP TM link receives the packets and routes them to the
+   `tm_realtime` stream.
+4. `FprimeFilePacketService` (the new service) is subscribed to
+   `tm_realtime`, filters for the file APID, and reassembles the file:
+   - On `T_START`: opens an in-memory transfer, allocates a buffer of the
+     declared file size, fires a YAMCS event `FileTransferStarted`.
+   - On each `T_DATA`: writes payload at `byteOffset`, updates a progress
+     counter exposed as a YAMCS system parameter (so operators see a
+     progress bar in the YAMCS UI without any custom widget).
+   - On `T_END`: validates the CFDP modular checksum against the buffer.
+     On match: writes the assembled bytes into the `fprimeFilesIn` bucket
+     and fires `FileTransferCompleted`. On mismatch: fires
+     `FileTransferFailed` and discards.
+5. Operator opens YAMCS web UI → Buckets → `fprimeFilesIn` and downloads
+   the file with one click. Buckets are a built-in YAMCS feature with a
+   web UI, REST API, and CLI (`yamcs storage`) — all available for free.
+
+**Why buckets matter:** YAMCS already provides a generic file storage
+abstraction with web UI, REST API, CLI, and access control. The new
+service does not need to build a "file browser" — it just deposits bytes
+into a bucket and YAMCS handles the rest.
+
+**Why progress as a system parameter matters:** if the service publishes
+`bytes_received` as a regular YAMCS parameter, it gets archived, alarmed,
+plotted, and exposed via the existing parameter API like any other
+telemetry channel. No custom UI required for "is my transfer progressing?"
+
+### Uplink (operator → spacecraft)
+
+**Goal:** push `new_sequence.bin` from the operator's laptop to
+`/sd0/sequences/new_sequence.bin` on the spacecraft.
+
+The interesting design question is *how does the operator trigger an
+uplink?* Three reasonable options:
+
+#### Option U1 — YAMCS command *(recommended)*
+
+Define a new YAMCS command `UplinkFile` in the XTCE dictionary with two
+arguments: source bucket object name and destination spacecraft path.
+The command flows through YAMCS's normal command stack, but the receiving
+end is `FprimeFilePacketService` (registered as a command handler), not
+the TC link.
+
+Workflow:
+
+1. Operator drags `new_sequence.bin` into the `fprimeFilesOut` bucket via
+   the YAMCS web UI, CLI, or REST API.
+2. Operator issues `UplinkFile(bucket="fprimeFilesOut",
+   obj="new_sequence.bin", dest="/sd0/sequences/new_sequence.bin")` from
+   the YAMCS command stack.
+3. Service reads bytes from the bucket, computes the CFDP modular
+   checksum, generates `T_START` → `T_DATA`(×N) → `T_END` packets sized to
+   `downlinkPacketSize`, frames each as a CCSDS packet on the file APID,
+   and writes them to `tc_realtime`. The existing UDP TC link ships them
+   to the spacecraft.
+4. Spacecraft `FileUplink` receives, reassembles, validates, writes to
+   disk, and fires its own F´ event. YAMCS already archives that event via
+   its event recorder.
+5. Operator sees confirmation in the YAMCS event log.
+
+**Why U1 is best:** uplink is a command, and YAMCS already has a complete
+command-history, authorization, command-stack, and verifier pipeline.
+Modeling uplink as a command gets queueing, audit trail, and access
+control for free.
+
+#### Option U2 — Bucket-watch trigger
+
+Service watches `fprimeFilesOut`. Any new object automatically triggers
+an uplink to a path derived from object metadata.
+
+- Pros: drag-and-drop UX, no command needed.
+- Cons: implicit, hard to authorize, hard to retry, hard to specify
+  destination path. Worse for ops than U1.
+
+#### Option U3 — Pure REST API
+
+Add an HTTP endpoint `POST /api/fprime-files/uplink` on the new service.
+Operators or scripts call it directly.
+
+- Pros: scriptable.
+- Cons: bypasses command history. Harder for human operators.
+
+**Recommended:** U1 as the primary operator path. U3 added later if
+scripted automation is needed. Skip U2.
+
+### What the spacecraft never knows
+
+In this entire vision, the spacecraft does not know YAMCS exists. It does
+not know files are being archived in buckets. It does not know there is a
+custom YAMCS service. From its perspective it is sending and receiving the
+same `Fw::FilePacket`s it has always sent. All of the new logic lives on
+the ground, in one Java class plus XTCE container definitions.
+
+### Honest gaps in this vision
+
+1. **Lossy links.** If a `T_DATA` packet drops between spacecraft and
+   ground, F´ has no retransmit. The transfer's checksum will fail and
+   the operator must retry the whole transfer. CFDP Class 2 has NAK-based
+   reliability for exactly this reason. If link loss is a realistic
+   concern for PROVES, Option C inherits F´'s "best effort" semantics, and
+   a retry-on-failure layer would need to be added later. Not a v0
+   problem.
+2. **Concurrent transfers.** v0 supports one transfer at a time per
+   direction. F´ `FileUplink` and `FileDownlink` are themselves
+   single-channel, so this matches reality.
+3. **No CFDP interoperability.** If a future mission needs to talk to a
+   spacecraft that does speak CFDP, this service does not help — enable
+   YAMCS's standard `CfdpService` in parallel on a different APID. The
+   two services can coexist on different streams.
+4. **Operator UX is bucket-based, not transfer-based.** Operators see
+   "files in a folder," not "transfer #47 is 73% complete with 2 retries."
+   If a transfer-centric view matters, build a small YAMCS web extension
+   later. Out of scope for v0.
+
 ## Recommended path forward
 
 1. **Confirm Option C with the ticket author and @LeStarch.** Specifically
