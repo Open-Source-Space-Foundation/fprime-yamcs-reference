@@ -575,11 +575,27 @@ is a specific bug worth pinning with a fast in-CI regression test.
 6. **Document the operator workflow**: how to retrieve a downlinked file
    from the bucket; how to queue a file for uplink.
 
+## Resolved facts (from this deployment, verified)
+
+- **File packet APID: `0x0003`** (decimal 3), defined as `FW_PACKET_FILE` in
+  `lib/fprime/default/config/ComCfg.fpp:27`. This deployment does not
+  override the default ComCfg, so the value is in effect as-is. Triple-
+  confirmed:
+  1. F´ default config: `FW_PACKET_FILE = 0x0003`
+  2. XTCE dictionary already lists it:
+     `fprime.xtce.xml:174` → `<Enumeration value="3" label="FW_PACKET_FILE">`
+  3. YAMCS data link config uses `spacecraftId: 68` which matches the
+     ComCfg `SpacecraftId = 0x0044`, confirming both sides agree on
+     framing parameters.
+- **Spacecraft ID: `0x0044`** (decimal 68).
+- **TM frame fixed size: 1024 bytes.**
+- F´'s `ComCfg::Apid` enum values are constrained by `static_assert` to
+  match `Fw::ComPacketType` exactly (see `ApidManager.hpp:21-31`), so the
+  CCSDS APID *is* the F´ packet-type discriminator. No room for the
+  outer and inner discriminators to disagree.
+
 ## Open questions
 
-- Which APID is reserved for file packets in this deployment? It needs to be
-  agreed across F´ topology config, the XTCE dictionary, and the YAMCS
-  service.
 - Does the team have prior experience writing YAMCS Java plugins, or is this
   the first one? If first, budget extra time for the YAMCS plugin build/load
   cycle.
