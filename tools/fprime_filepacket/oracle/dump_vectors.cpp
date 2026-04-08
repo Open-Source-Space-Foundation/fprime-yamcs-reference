@@ -25,22 +25,23 @@
 
 namespace {
 
-// Write a Buffer's bytes to a file. Returns 0 on success, nonzero on error.
-int write_buffer(const std::string& path, const Fw::Buffer& buf) {
+// Write the first `length` bytes of a Buffer to a file. Returns 0 on
+// success, nonzero on error. We pass `length` explicitly because
+// Fw::Buffer carries capacity, not fill level — the packet's own
+// bufferSize() method is the source of truth for serialized length.
+int write_buffer(const std::string& path, const Fw::Buffer& buf, U32 length) {
     FILE* f = std::fopen(path.c_str(), "wb");
     if (!f) {
         std::fprintf(stderr, "ERROR: cannot open %s for writing\n", path.c_str());
         return 1;
     }
-    const size_t n = std::fwrite(buf.getData(), 1, buf.getSize(), f);
+    const size_t n = std::fwrite(buf.getData(), 1, length, f);
     std::fclose(f);
-    if (n != buf.getSize()) {
+    if (n != length) {
         std::fprintf(stderr, "ERROR: short write to %s\n", path.c_str());
         return 2;
     }
-    std::printf("  wrote %s (%u bytes)\n",
-                path.c_str(),
-                static_cast<unsigned>(buf.getSize()));
+    std::printf("  wrote %s (%u bytes)\n", path.c_str(), static_cast<unsigned>(length));
     return 0;
 }
 
@@ -71,7 +72,7 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "ERROR: StartPacket toBuffer failed\n");
             return 10;
         }
-        if (write_buffer(out_dir + "/start_seq0_size100_a_b.bin", buf) != 0) return 11;
+        if (write_buffer(out_dir + "/start_seq0_size100_a_b.bin", buf, start.bufferSize()) != 0) return 11;
     }
 
     // ----------------------------------------------------------------
@@ -88,7 +89,7 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "ERROR: DataPacket toBuffer failed\n");
             return 20;
         }
-        if (write_buffer(out_dir + "/data_seq1_off0_hello.bin", buf) != 0) return 21;
+        if (write_buffer(out_dir + "/data_seq1_off0_hello.bin", buf, data.bufferSize()) != 0) return 21;
     }
 
     // ----------------------------------------------------------------
@@ -109,7 +110,7 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "ERROR: EndPacket toBuffer failed\n");
             return 30;
         }
-        if (write_buffer(out_dir + "/end_seq2_hello_checksum.bin", buf) != 0) return 31;
+        if (write_buffer(out_dir + "/end_seq2_hello_checksum.bin", buf, end.bufferSize()) != 0) return 31;
     }
 
     // ----------------------------------------------------------------
@@ -125,7 +126,7 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "ERROR: CancelPacket toBuffer failed\n");
             return 40;
         }
-        if (write_buffer(out_dir + "/cancel_seq3.bin", buf) != 0) return 41;
+        if (write_buffer(out_dir + "/cancel_seq3.bin", buf, cancel.bufferSize()) != 0) return 41;
     }
 
     std::printf("OK\n");

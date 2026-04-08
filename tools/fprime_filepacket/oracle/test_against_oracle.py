@@ -34,17 +34,18 @@ def _read_vector(name: str) -> bytes:
     return (VECTORS_DIR / name).read_bytes()
 
 
-def _assert_prefix(actual: bytes, expected_prefix: bytes, label: str) -> None:
-    """The C++ oracle dumps full buffer storage (capacity), not just the
-    serialized prefix, so trailing bytes are zero padding. Compare only the
-    first len(expected_prefix) bytes.
+def _assert_equal(actual: bytes, expected: bytes, label: str) -> None:
+    """Assert exact byte equality between the F´ golden and the Python encoder.
+
+    The C++ oracle now writes only the serialized length (via each packet's
+    public bufferSize() method), so the goldens are exact-size — no trailing
+    zero padding to skip past.
     """
-    head = actual[: len(expected_prefix)]
-    if head != expected_prefix:
+    if actual != expected:
         raise AssertionError(
             f"{label}: mismatch\n"
-            f"  expected: {expected_prefix.hex(' ')}\n"
-            f"  actual:   {head.hex(' ')}"
+            f"  expected ({len(expected)}B): {expected.hex(' ')}\n"
+            f"  actual   ({len(actual)}B): {actual.hex(' ')}"
         )
 
 
@@ -56,7 +57,7 @@ def test_start_matches_oracle():
         destination_path="b",
     ).to_bytes()
     fpr = _read_vector("start_seq0_size100_a_b.bin")
-    _assert_prefix(fpr, py, "StartPacket")
+    _assert_equal(fpr, py, "StartPacket")
 
 
 def test_data_matches_oracle():
@@ -66,7 +67,7 @@ def test_data_matches_oracle():
         data=b"hello",
     ).to_bytes()
     fpr = _read_vector("data_seq1_off0_hello.bin")
-    _assert_prefix(fpr, py, "DataPacket")
+    _assert_equal(fpr, py, "DataPacket")
 
 
 def test_end_matches_oracle():
@@ -77,13 +78,13 @@ def test_end_matches_oracle():
         checksum=0xD7656C6C,
     ).to_bytes()
     fpr = _read_vector("end_seq2_hello_checksum.bin")
-    _assert_prefix(fpr, py, "EndPacket")
+    _assert_equal(fpr, py, "EndPacket")
 
 
 def test_cancel_matches_oracle():
     py = CancelPacket(sequence_index=3).to_bytes()
     fpr = _read_vector("cancel_seq3.bin")
-    _assert_prefix(fpr, py, "CancelPacket")
+    _assert_equal(fpr, py, "CancelPacket")
 
 
 if __name__ == "__main__":
