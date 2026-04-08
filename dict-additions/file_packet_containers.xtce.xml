@@ -1,0 +1,170 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Proposed XTCE additions for Fw::FilePacket support in YAMCS.
+
+  This is NOT a standalone XTCE file. It is a fragment showing the
+  Parameters and SequenceContainers that need to be added to the existing
+  fprime.xtce.xml shipped by the fprime-yamcs Python package, currently at:
+
+    fprime-venv/lib/python3.11/site-packages/fprime_yamcs/yamcs/src/main/yamcs/mdb/fprime.xtce.xml
+
+  Pattern reference: this fragment is modeled directly on the existing
+  FPrimeEvent / FPrimeTelemetryChannel / FPrimeTelemetryPacket containers
+  in that file (lines 605-648 in the version checked at session time).
+
+  Wire-format reference: lib/fprime/Fw/FilePacket/FilePacket.hpp.
+
+  APID for file packets: 3 (FW_PACKET_FILE), defined in
+  lib/fprime/default/config/ComCfg.fpp:27.
+
+  These additions only describe DOWNLINK file packets — packets the
+  spacecraft sends to the ground via FileDownlink. UPLINK packets
+  (FileUplink, ground → spacecraft) use the same wire format but flow
+  through TC, not TM, and are emitted by the new FprimeFilePacketService
+  rather than parsed by XTCE. They do not need container definitions
+  here.
+
+  TODO before merging upstream:
+    - Confirm with @LeStarch that this matches the in-flight dictionary
+      work; align naming conventions.
+    - Decide whether ASCII path names should use a UTF-8 string type
+      instead. F´ stores raw bytes; the HPP uses `const char*`.
+    - Verify the StringDataEncoding fragment below against an actual
+      F´ FilePacket capture; F´ uses a leading U8 size, but the
+      existing fprime.xtce.xml uses a different LeadingSize idiom for
+      strings — pick the one that round-trips against the codec at
+      tools/fprime_filepacket/.
+-->
+
+<!-- ============================================================ -->
+<!-- New parameters (add to <ParameterSet> around line 497)       -->
+<!-- ============================================================ -->
+
+<Parameter name="FPrimeFilePacketType"
+           parameterTypeRef="U8"
+           shortDescription="Fw::FilePacket::Type discriminator: 0=START 1=DATA 2=END 3=CANCEL" />
+
+<Parameter name="FPrimeFilePacketSeqIndex"
+           parameterTypeRef="U32"
+           shortDescription="Sequence index within a single file transfer" />
+
+<Parameter name="FPrimeFilePacketFileSize"
+           parameterTypeRef="U32"
+           shortDescription="Total file size in bytes (StartPacket only)" />
+
+<Parameter name="FPrimeFilePacketByteOffset"
+           parameterTypeRef="U32"
+           shortDescription="Byte offset of payload into destination file (DataPacket only)" />
+
+<Parameter name="FPrimeFilePacketDataSize"
+           parameterTypeRef="U16"
+           shortDescription="Length of payload in this DataPacket" />
+
+<Parameter name="FPrimeFilePacketChecksum"
+           parameterTypeRef="U32"
+           shortDescription="CFDP modular checksum of complete file (EndPacket only)" />
+
+<!--
+  Path name parameters: F´ encodes a path as U8 length + chars (no null
+  terminator). Use a string parameter type with a leading U8 size tag.
+  See TODO in header about confirming the exact StringDataEncoding form.
+-->
+<Parameter name="FPrimeFilePacketSourcePath"
+           parameterTypeRef="FPrimeFilePathType"
+           shortDescription="Source path on the spacecraft (StartPacket only)" />
+
+<Parameter name="FPrimeFilePacketDestinationPath"
+           parameterTypeRef="FPrimeFilePathType"
+           shortDescription="Destination path on the ground (StartPacket only)" />
+
+<!-- ============================================================ -->
+<!-- New parameter type (add to <ParameterTypeSet>)               -->
+<!-- ============================================================ -->
+
+<StringParameterType name="FPrimeFilePathType">
+  <StringDataEncoding>
+    <Variable maxSizeInBits="2048">  <!-- 255 bytes * 8 -->
+      <DynamicValue>
+        <ParameterInstanceRef parameterRef="_yamcs_ignore" />
+      </DynamicValue>
+      <LeadingSize sizeInBitsOfSizeTag="8" />
+    </Variable>
+  </StringDataEncoding>
+</StringParameterType>
+
+<!-- ============================================================ -->
+<!-- New containers (add to <ContainerSet> after FPrimeEvent)     -->
+<!-- ============================================================ -->
+
+<!--
+  Abstract base for any file packet, gating on APID 3.
+  Parses the F´ ComPacket descriptor (DataDescType U16) and the
+  Fw::FilePacket::Header (U8 type + U32 sequenceIndex).
+-->
+<SequenceContainer name="FPrimeFilePacket" abstract="true">
+  <EntryList>
+    <ParameterRefEntry parameterRef="DataDescType" />
+    <ParameterRefEntry parameterRef="FPrimeFilePacketType" />
+    <ParameterRefEntry parameterRef="FPrimeFilePacketSeqIndex" />
+  </EntryList>
+  <BaseContainer containerRef="CCSDSSpacePacket">
+    <RestrictionCriteria>
+      <ComparisonList>
+        <Comparison parameterRef="CCSDS_Packet_ID/Version" value="0" />
+        <Comparison parameterRef="CCSDS_Packet_ID/APID" value="3" />
+      </ComparisonList>
+    </RestrictionCriteria>
+  </BaseContainer>
+</SequenceContainer>
+
+<SequenceContainer name="FPrimeFilePacketStart">
+  <EntryList>
+    <ParameterRefEntry parameterRef="FPrimeFilePacketFileSize" />
+    <ParameterRefEntry parameterRef="FPrimeFilePacketSourcePath" />
+    <ParameterRefEntry parameterRef="FPrimeFilePacketDestinationPath" />
+  </EntryList>
+  <BaseContainer containerRef="FPrimeFilePacket">
+    <RestrictionCriteria>
+      <Comparison parameterRef="FPrimeFilePacketType" value="0" />
+    </RestrictionCriteria>
+  </BaseContainer>
+</SequenceContainer>
+
+<SequenceContainer name="FPrimeFilePacketData">
+  <EntryList>
+    <ParameterRefEntry parameterRef="FPrimeFilePacketByteOffset" />
+    <ParameterRefEntry parameterRef="FPrimeFilePacketDataSize" />
+    <!--
+      Followed by FPrimeFilePacketDataSize bytes of payload. The payload
+      is intentionally not modeled as a parameter — it is consumed by the
+      FprimeFilePacketService directly out of the raw stream, since
+      reassembling it into a YAMCS parameter would defeat the bucket-based
+      storage design.
+    -->
+  </EntryList>
+  <BaseContainer containerRef="FPrimeFilePacket">
+    <RestrictionCriteria>
+      <Comparison parameterRef="FPrimeFilePacketType" value="1" />
+    </RestrictionCriteria>
+  </BaseContainer>
+</SequenceContainer>
+
+<SequenceContainer name="FPrimeFilePacketEnd">
+  <EntryList>
+    <ParameterRefEntry parameterRef="FPrimeFilePacketChecksum" />
+  </EntryList>
+  <BaseContainer containerRef="FPrimeFilePacket">
+    <RestrictionCriteria>
+      <Comparison parameterRef="FPrimeFilePacketType" value="2" />
+    </RestrictionCriteria>
+  </BaseContainer>
+</SequenceContainer>
+
+<SequenceContainer name="FPrimeFilePacketCancel">
+  <EntryList />
+  <BaseContainer containerRef="FPrimeFilePacket">
+    <RestrictionCriteria>
+      <Comparison parameterRef="FPrimeFilePacketType" value="3" />
+    </RestrictionCriteria>
+  </BaseContainer>
+</SequenceContainer>
