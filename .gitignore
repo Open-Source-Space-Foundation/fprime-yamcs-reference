@@ -17,3 +17,5 @@ build-fprime-*
 /.vscode/
 .DS_Store
 *.gcov
+__pycache__/
+*.pyc
