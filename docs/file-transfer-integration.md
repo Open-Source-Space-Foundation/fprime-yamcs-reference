@@ -380,6 +380,182 @@ the ground, in one Java class plus XTCE container definitions.
    If a transfer-centric view matters, build a small YAMCS web extension
    later. Out of scope for v0.
 
+## Testing strategy
+
+Testing for Option C is layered. Cheaper, faster tests run continuously
+in CI; more realistic tests run less often. Each layer covers what the
+layer below cannot.
+
+```
+                       ┌──────────────────────────┐
+                       │   L5: hardware loop      │   manual, slow,
+                       │   real spacecraft / radio│   highest fidelity
+                       └──────────────────────────┘
+                   ┌──────────────────────────────────┐
+                   │   L4: end-to-end, real F´ binary │   minutes
+                   └──────────────────────────────────┘
+               ┌──────────────────────────────────────────┐
+               │   L3: end-to-end, fake spacecraft        │   seconds,
+               │   (Python harness, real YAMCS)           │   the ticket's
+               │                                          │   recommended
+               │                                          │   starting point
+               └──────────────────────────────────────────┘
+           ┌──────────────────────────────────────────────────┐
+           │   L2: YAMCS service integration tests            │   ms, in CI
+           └──────────────────────────────────────────────────┘
+       ┌──────────────────────────────────────────────────────────┐
+       │   L1: Java codec unit tests                              │   <1s,
+       │   known byte vectors → struct → bytes round-trip         │   in CI
+       └──────────────────────────────────────────────────────────┘
+```
+
+### L1 — Java codec unit tests
+
+Pure functions: encode and decode each `Fw::FilePacket` variant against
+known byte vectors. No YAMCS, no IO, no threading.
+
+**Cheat code:** F´ already ships its own GTest suite for `Fw::FilePacket`
+at `lib/fprime/Fw/FilePacket/GTest/`. Use it as a cross-implementation
+oracle by either:
+
+- Modifying the F´ tests to dump bytes to disk once and committing the
+  resulting `.bin` files as Java test resources, or
+- Writing a small C++ utility that uses `Fw::FilePacket` to encode known
+  inputs and emit golden `.bin` files. Run once, commit, never touch
+  again.
+
+If the Java decoder produces the same struct that F´'s C++ encoder
+started with, the wire formats agree bit-for-bit. This is the most
+important test in the whole strategy because every higher layer depends
+on the wire format being correct.
+
+### L2 — YAMCS service integration tests
+
+Run YAMCS in embedded test mode (its built-in JUnit harness). For each
+test:
+
+1. Spin up an instance with `FprimeFilePacketService` configured.
+2. Inject bytes into `tm_realtime` as if they came from the UDP TM link.
+3. Assert that the file appears in the `fprimeFilesIn` bucket with the
+   expected contents and that the expected events fired.
+4. For uplink: issue `UplinkFile` via the YAMCS internal API, capture
+   what the service writes to `tc_realtime`, decode, and assert it
+   matches a known FilePacket sequence.
+
+L2 covers everything *inside* YAMCS — service startup, stream wiring,
+bucket access, command handling — without involving any external
+process.
+
+### L3 — End-to-end without the F´ binary *(start here)*
+
+This is the level the ticket explicitly endorses: "We can start testing
+with the standard YAMCS reference (no FPRIME) and make progress."
+
+A small Python harness (~80 lines using `spacepackets`) plays the role
+of the spacecraft on `127.0.0.1:50000` (TM out) and `127.0.0.1:50001`
+(TC in).
+
+**Downlink test:**
+
+1. Pick a known file (e.g. 50 KB of random bytes), hash it.
+2. Python harness encodes it as `Fw::FilePacket` (Start + Data×N + End),
+   wraps each in a CCSDS packet on the file APID, and sends to YAMCS UDP
+   TM.
+3. Wait up to 5 s for the file to appear in the `fprimeFilesIn` bucket
+   (poll via `yamcs-client`, already in `requirements.txt`).
+4. Hash the bucket contents. Assert equal to the original.
+
+**Uplink test:**
+
+1. Drop a known file into the `fprimeFilesOut` bucket via `yamcs-client`.
+2. Issue the `UplinkFile` command via `yamcs-client`.
+3. Python harness `recv()`s on YAMCS's TC port, collects FilePacket
+   bytes, reassembles, hashes.
+4. Assert equal to the original.
+
+L3 is the workhorse layer. Most of the ongoing test investment should
+live here because it tests the real YAMCS service against the real wire
+format without the slow F´ build/run cycle.
+
+### L4 — End-to-end with the real F´ binary
+
+Same shape as L3, but with the actual `FprimeYamcsReference_YamcsDeployment`
+binary in place of the Python harness.
+
+**Downlink:**
+
+1. Build and launch the F´ deployment via `fprime-yamcs` per the README.
+2. Use `yamcs-client` to issue `FileDownlink.SendFile` for a file that
+   exists on the F´ side (or seed one via `FileManager` first).
+3. Poll the bucket. Hash. Assert.
+
+**Uplink:**
+
+1. Drop a file into the bucket.
+2. Issue `UplinkFile`.
+3. Wait for F´'s `fileUplink.FileReceived` event in YAMCS's event log
+   (already in the dictionary).
+4. Optionally read the file back via `FileManager` and verify length.
+
+These cycles take minutes (build time) but catch end-to-end issues —
+APID mismatches, framing oddities, drift between XTCE and the F´
+topology — that L3 cannot see.
+
+### L5 — Hardware in the loop
+
+The L4 tests, but the F´ binary runs on the actual cubesat or a
+flight-equivalent board, talking over the actual radio link or a
+serial-to-UDP bridge. Manual, low-frequency, high-cost.
+
+L5 is where:
+
+- Real packet loss, jitter, and link rate behavior surface.
+- Timing under realistic CPU and downlink-rate constraints can be
+  measured.
+- The "lossy links" gap from the design (v0 has no retransmit) actually
+  bites — and where the team will learn whether "retry the whole
+  transfer" is acceptable in practice.
+
+### Properties to test explicitly
+
+Beyond "does a file move," the following cases should be covered
+deliberately:
+
+| Property                                  | Why it matters                          | Layer |
+| ----------------------------------------- | --------------------------------------- | ----- |
+| Empty file (0 bytes)                      | Off-by-one in "did we get all DATA"     | L1, L3 |
+| File exactly 1 packet long                | Boundary: do we need DATA packets at all| L1, L3 |
+| File exactly N × packetSize long          | Last DATA has a full payload            | L3    |
+| File N × packetSize + 1 byte long         | Last DATA has a 1-byte payload          | L3    |
+| Large file (>1 MB)                        | Reassembly buffer behavior              | L3, L4 |
+| Path with non-ASCII characters            | PathName encoding                       | L1    |
+| Maximum-length path (255 bytes)           | PathName length field boundary          | L1    |
+| Out-of-order DATA packets                 | F´ warns; the service should too        | L2    |
+| Missing DATA packet                       | Checksum must fail; no false success    | L2, L3 |
+| Wrong checksum on End                     | Reject file, fire alarm                 | L2    |
+| Two transfers back-to-back                | Service must reset state cleanly        | L3    |
+| Cancel packet mid-transfer                | v0: log; v1: real handling              | L2    |
+| **Round-trip identity** (uplink→downlink) | Catches any wire bug in either direction| L4    |
+
+The round-trip test at L4 is the single most useful test in the suite —
+it catches almost any wire format or framing bug in either direction
+simultaneously, and it makes a good pre-flight-rehearsal smoke test.
+
+### Recommended sequencing for test work
+
+1. **L1** — codec unit tests with golden vectors generated from F´'s own
+   C++. The foundation; everything above depends on it.
+2. **L3 downlink** against vanilla YAMCS with the Python fake spacecraft.
+3. **L3 uplink.**
+4. **L4** with the real F´ binary, downlink first, then uplink.
+5. **L2** unit tests filled in retroactively to lock down any regression
+   L3 caught.
+6. **L5** hardware loop when flight-equivalent hardware is available.
+
+L2 is intentionally not first: its setup cost (embedded YAMCS) is high
+and its unique coverage relative to L3 is low. Only build L2 when there
+is a specific bug worth pinning with a fast in-CI regression test.
+
 ## Recommended path forward
 
 1. **Confirm Option C with the ticket author and @LeStarch.** Specifically
