@@ -2,6 +2,7 @@ package org.fprimeyamcs.reference;
 
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
+import java.util.Map;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -17,6 +18,7 @@ import org.yamcs.yarch.Stream;
 import org.yamcs.yarch.StreamSubscriber;
 import org.yamcs.yarch.Tuple;
 import org.yamcs.yarch.YarchDatabase;
+import org.yamcs.yarch.YarchDatabaseInstance;
 
 /**
  * Reassembles {@code Fw::FilePacket} downlink streams from F´ into complete
@@ -128,7 +130,7 @@ public class FprimeFilePacketService extends AbstractYamcsService implements Str
     protected void doStart() {
         try {
             // Resolve the TM stream we'll subscribe to.
-            YarchDatabase yarch = YarchDatabase.getInstance(yamcsInstance);
+            YarchDatabaseInstance yarch = YarchDatabase.getInstance(yamcsInstance);
             this.inStream = yarch.getStream(inStreamName);
             if (this.inStream == null) {
                 notifyFailed(new IllegalStateException(
@@ -292,8 +294,11 @@ public class FprimeFilePacketService extends AbstractYamcsService implements Str
                 : inflight.destinationPath;
 
         try {
-            bucket.putObject(objectName, "application/octet-stream", null,
-                    inflight.reassemblyBuffer);
+            // putObjectAsync returns a CompletableFuture<Void>; block on it so
+            // we can log a single COMPLETE/FAILED line per transfer instead of
+            // racing the next packet on the stream.
+            bucket.putObjectAsync(objectName, "application/octet-stream",
+                    Map.of(), inflight.reassemblyBuffer).join();
             LOG.info("File transfer COMPLETE: {} ({} bytes) -> bucket {}",
                     objectName, inflight.bytesReceived, bucketName);
         } catch (Exception e) {
