@@ -19,3 +19,4 @@ build-fprime-*
 *.gcov
 __pycache__/
 *.pyc
+/tools/fprime_filepacket/oracle/dump_vectors
