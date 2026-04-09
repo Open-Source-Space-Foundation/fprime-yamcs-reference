@@ -107,6 +107,12 @@ module FprimeYamcsReference {
       rateGroup1.RateGroupMemberOut[2] -> systemResources.run
       rateGroup1.RateGroupMemberOut[3] -> ComCcsds.comQueue.run
       rateGroup1.RateGroupMemberOut[4] -> ComCcsds.aggregator.timeout
+      # Tick FileManager so ListDirectory's async state machine can
+      # advance past ListDirectoryStarted. Without this connection, F´
+      # FileManager starts a directory listing but never emits the
+      # DirectoryListing entries — the schedIn_handler is where the
+      # listing loop lives.
+      rateGroup1.RateGroupMemberOut[5] -> FileHandling.fileManager.schedIn
 
       # Rate group 2
       rateGroupDriver.CycleOut[Ports_RateGroups.rateGroup2] -> rateGroup2.CycleIn

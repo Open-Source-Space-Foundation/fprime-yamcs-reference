@@ -8,13 +8,20 @@ import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.CopyOnWriteArraySet;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+
+import com.google.protobuf.Timestamp;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -33,13 +40,21 @@ import org.yamcs.filetransfer.AbstractFileTransferService;
 import org.yamcs.filetransfer.FileTransfer;
 import org.yamcs.filetransfer.FileTransferFilter;
 import org.yamcs.filetransfer.InvalidRequestException;
+import org.yamcs.filetransfer.RemoteFileListMonitor;
 import org.yamcs.filetransfer.TransferMonitor;
 import org.yamcs.filetransfer.TransferOptions;
 import org.yamcs.protobuf.Commanding.CommandId;
 import org.yamcs.protobuf.EntityInfo;
 import org.yamcs.protobuf.FileTransferCapabilities;
+import org.yamcs.protobuf.ListFilesResponse;
+import org.yamcs.protobuf.RemoteFile;
 import org.yamcs.protobuf.TransferDirection;
 import org.yamcs.protobuf.TransferState;
+// Note: the events_realtime stream carries the *internal* Db.Event
+// protobuf, NOT org.yamcs.protobuf.Event (the external API type).
+// Don't mix them up — they're wire-incompatible classes with the same
+// field names.
+import org.yamcs.yarch.protobuf.Db.Event;
 import org.yamcs.security.User;
 import org.yamcs.xtce.MetaCommand;
 import org.yamcs.tctm.Link;
@@ -201,7 +216,36 @@ public class FprimeFilePacketService extends AbstractFileTransferService impleme
     private Processor processor;
     private CommandingManager commandingManager;
     private MetaCommand fileDownlinkCommand;  // may be null if not in MDB
+    private MetaCommand listDirectoryCommand; // may be null if not in MDB
     private User systemUser;
+
+    // Remote file listing state. Inspired by CFDP's approach: keep an
+    // in-progress accumulator per directory, flip to fileListCache on
+    // the terminal event, notify RemoteFileListMonitor subscribers.
+    private Stream eventsStream;
+    private final Map<String, ListingAccumulator> inProgressListings = new ConcurrentHashMap<>();
+    private final Map<String, ListFilesResponse> fileListCache = new ConcurrentHashMap<>();
+    private final Set<RemoteFileListMonitor> remoteFileListMonitors = new CopyOnWriteArraySet<>();
+    private String listDirectoryCommandName;
+    private String listDirDirNameArg;
+
+    // F´ event format strings from lib/fprime/Svc/FileManager/Events.fppi,
+    // with the [EventName] prefix that fprime-yamcs-events prepends before
+    // publishing to YAMCS. These are the canonical formats — the regex
+    // parser is coupled to this format and must be updated if F´ changes
+    // the event templates. A proper long-term fix is to patch
+    // fprime-yamcs-events to populate Event.extra with the structured
+    // arg map it already builds but currently discards (processor.py:209).
+    private static final Pattern DIR_LISTING_RE = Pattern.compile(
+            "^\\[DirectoryListing\\] Directory (.+?): (.+?) \\((\\d+) bytes\\)$");
+    private static final Pattern DIR_LISTING_SUBDIR_RE = Pattern.compile(
+            "^\\[DirectoryListingSubdir\\] Directory (.+?): (.+?)$");
+    private static final Pattern LIST_DIR_SUCCEEDED_RE = Pattern.compile(
+            "^\\[ListDirectorySucceeded\\] Directory (.+?) contains (\\d+) files$");
+    private static final Pattern LIST_DIR_STARTED_RE = Pattern.compile(
+            "^\\[ListDirectoryStarted\\] Directory (.+?) listing started$");
+    // Don't strictly match the error format since we treat any error as
+    // terminal failure. We only need the event type match, not the args.
 
     // In-flight downlink transfer state. v0 supports one transfer at a time.
     // null means idle.
@@ -257,6 +301,11 @@ public class FprimeFilePacketService extends AbstractFileTransferService impleme
                 "FileHandling|fileDownlink|SendFile|sourceFileName");
         spec.addOption("destFileNameArg", OptionType.STRING).withDefault(
                 "FileHandling|fileDownlink|SendFile|destFileName");
+        // Remote file listing: F´ FileManager.ListDirectory command.
+        spec.addOption("listDirectoryCommand", OptionType.STRING).withDefault(
+                "/FprimeYamcsReference|YamcsDeployment/FileHandling|fileManager|ListDirectory");
+        spec.addOption("listDirDirNameArg", OptionType.STRING).withDefault(
+                "FileHandling|fileManager|ListDirectory|dirName");
         return spec;
     }
 
@@ -278,6 +327,10 @@ public class FprimeFilePacketService extends AbstractFileTransferService impleme
                 "FileHandling|fileDownlink|SendFile|sourceFileName");
         this.destFileNameArg = config.getString("destFileNameArg",
                 "FileHandling|fileDownlink|SendFile|destFileName");
+        this.listDirectoryCommandName = config.getString("listDirectoryCommand",
+                "/FprimeYamcsReference|YamcsDeployment/FileHandling|fileManager|ListDirectory");
+        this.listDirDirNameArg = config.getString("listDirDirNameArg",
+                "FileHandling|fileManager|ListDirectory|dirName");
 
         LOG.info("FprimeFilePacketService init: inStream={} bucket={} fileApid={}"
                 + " uplinkLink={} fprime={}:{} chunk={}B scid={} vcid={}",
@@ -292,11 +345,9 @@ public class FprimeFilePacketService extends AbstractFileTransferService impleme
     @Override
     protected void addCapabilities(FileTransferCapabilities.Builder b) {
         b.setUpload(true)          // operators can push files to F´
-         .setDownload(true)        // operators can pull files from F´ (by
-                                   // synthesizing an F´ FileDownlink.SendFile
-                                   // command under the hood)
+         .setDownload(true)        // operators can pull files from F´
          .setRemotePath(true)      // paths on either side are arbitrary
-         .setFileList(false)       // no remote file listing
+         .setFileList(true)        // browse F´'s filesystem via the UI
          .setHasTransferType(false)
          .setPauseResume(false);
     }
@@ -317,49 +368,252 @@ public class FprimeFilePacketService extends AbstractFileTransferService impleme
                 .build());
     }
 
-    // FileListingService (parent interface) — we don't support remote
-    // file listing. Capabilities.fileList is false, so the YAMCS UI will
-    // not surface listing actions, but the interface still requires these
-    // methods to be implemented.
-    @Override
-    public void saveFileList(org.yamcs.protobuf.ListFilesResponse listing) {
-        // no-op
-    }
+    // ----------------------------------------------------------------------
+    // FileListingService — remote file browser backing
+    //
+    // Mirrors CfdpService's pattern: fetchFileList triggers an async
+    // remote-side operation (here, an F´ ListDirectory command),
+    // getFileList returns the cached result for a path (or null),
+    // saveFileList writes into the cache, notifyRemoteFileListMonitors
+    // fans out to registered observers.
+    // ----------------------------------------------------------------------
 
     @Override
     public void fetchFileList(String localEntity, String remoteEntity,
                               String remotePath, Map<String, Object> options) {
-        // no-op
+        if (listDirectoryCommand == null) {
+            LOG.warn("fetchFileList({}): ListDirectory command unavailable", remotePath);
+            return;
+        }
+        String dirName = (remotePath == null || remotePath.isEmpty()) ? "." : remotePath;
+        LOG.info("fetchFileList: requesting F´ listing of {}", dirName);
+
+        // Create/refresh the accumulator for this directory. If a prior
+        // listing was in progress for the same path, discard it — the
+        // caller is asking for a fresh view.
+        inProgressListings.put(dirName, new ListingAccumulator(dirName));
+
+        try {
+            Map<String, Object> args = new java.util.HashMap<>();
+            args.put(listDirDirNameArg, dirName);
+            PreparedCommand pc = commandingManager.buildCommand(
+                    listDirectoryCommand, args,
+                    "FprimeFilePacketService-listing",
+                    0, systemUser);
+            commandingManager.sendCommand(systemUser, pc);
+        } catch (Exception e) {
+            LOG.error("fetchFileList({}): failed to dispatch ListDirectory command",
+                    dirName, e);
+            ListingAccumulator acc = inProgressListings.remove(dirName);
+            if (acc != null) {
+                // Publish a failed listing so the UI isn't stuck.
+                ListFilesResponse failed = acc.build("failed");
+                fileListCache.put(dirName, failed);
+                notifyRemoteFileListMonitors(failed);
+            }
+        }
     }
 
     @Override
-    public org.yamcs.protobuf.ListFilesResponse getFileList(String localEntity,
-            String remoteEntity, String remotePath, Map<String, Object> options) {
-        return null;
+    public ListFilesResponse getFileList(String localEntity, String remoteEntity,
+                                         String remotePath, Map<String, Object> options) {
+        String dirName = (remotePath == null || remotePath.isEmpty()) ? "." : remotePath;
+        return fileListCache.get(dirName);
     }
 
     @Override
-    public void registerRemoteFileListMonitor(
-            org.yamcs.filetransfer.RemoteFileListMonitor monitor) {
-        // no-op
+    public void saveFileList(ListFilesResponse listing) {
+        if (listing == null) return;
+        fileListCache.put(listing.getRemotePath(), listing);
     }
 
     @Override
-    public void unregisterRemoteFileListMonitor(
-            org.yamcs.filetransfer.RemoteFileListMonitor monitor) {
-        // no-op
+    public void registerRemoteFileListMonitor(RemoteFileListMonitor monitor) {
+        remoteFileListMonitors.add(monitor);
     }
 
     @Override
-    public void notifyRemoteFileListMonitors(
-            org.yamcs.protobuf.ListFilesResponse listing) {
-        // no-op
+    public void unregisterRemoteFileListMonitor(RemoteFileListMonitor monitor) {
+        remoteFileListMonitors.remove(monitor);
     }
 
     @Override
-    public java.util.Set<org.yamcs.filetransfer.RemoteFileListMonitor>
-            getRemoteFileListMonitors() {
-        return java.util.Collections.emptySet();
+    public void notifyRemoteFileListMonitors(ListFilesResponse listing) {
+        for (RemoteFileListMonitor m : remoteFileListMonitors) {
+            try {
+                m.receivedFileList(listing);
+            } catch (Exception e) {
+                LOG.warn("RemoteFileListMonitor threw", e);
+            }
+        }
+    }
+
+    @Override
+    public Set<RemoteFileListMonitor> getRemoteFileListMonitors() {
+        return new HashSet<>(remoteFileListMonitors);
+    }
+
+    // ----------------------------------------------------------------------
+    // Event subscriber — drives the listing state machine from F´ events
+    // ----------------------------------------------------------------------
+
+    /**
+     * Subscribes to {@code events_realtime} and routes F´ FileManager
+     * directory-listing events into the corresponding ListingAccumulator.
+     *
+     * <p>See the comment on {@link #DIR_LISTING_RE} for why we parse event
+     * messages with regex — the structured arg map is available inside
+     * fprime-yamcs-events but isn't propagated to the published YAMCS
+     * Event. A follow-up patch to fprime-yamcs-events would let this
+     * class read {@code Event.getExtra()} directly.
+     */
+    private final class EventTupleSubscriber implements StreamSubscriber {
+        @Override
+        public void onTuple(Stream stream, Tuple tuple) {
+            Object body = tuple.getColumn("body");
+            if (!(body instanceof Event)) {
+                return;
+            }
+            Event evt = (Event) body;
+            String type = evt.getType();
+            if (type == null) return;
+            String msg = evt.getMessage();
+            if (msg == null) return;
+
+            try {
+                switch (type) {
+                    case "DirectoryListing": {
+                        Matcher m = DIR_LISTING_RE.matcher(msg);
+                        if (m.matches()) {
+                            String dir = m.group(1);
+                            String file = m.group(2);
+                            long size = Long.parseLong(m.group(3));
+                            ListingAccumulator acc = inProgressListings.get(dir);
+                            if (acc != null) {
+                                acc.addFile(file, size);
+                            }
+                        } else {
+                            LOG.debug("DirectoryListing message did not match regex: {}", msg);
+                        }
+                        break;
+                    }
+                    case "DirectoryListingSubdir": {
+                        Matcher m = DIR_LISTING_SUBDIR_RE.matcher(msg);
+                        if (m.matches()) {
+                            String dir = m.group(1);
+                            String subdir = m.group(2);
+                            ListingAccumulator acc = inProgressListings.get(dir);
+                            if (acc != null) {
+                                acc.addSubdir(subdir);
+                            }
+                        }
+                        break;
+                    }
+                    case "ListDirectoryStarted": {
+                        // Informational — the accumulator was already
+                        // created by fetchFileList. Nothing to do.
+                        break;
+                    }
+                    case "ListDirectorySucceeded": {
+                        Matcher m = LIST_DIR_SUCCEEDED_RE.matcher(msg);
+                        if (m.matches()) {
+                            String dir = m.group(1);
+                            completeListing(dir, "completed");
+                        }
+                        break;
+                    }
+                    case "ListDirectoryError": {
+                        // Error messages carry the dirName as the first
+                        // argument; pull it from a minimal regex that
+                        // tolerates whatever suffix F´ adds.
+                        int dirStart = msg.indexOf("Directory ");
+                        if (dirStart >= 0) {
+                            String rest = msg.substring(dirStart + "Directory ".length());
+                            // Take up to first space/comma as the dir name.
+                            int end = rest.length();
+                            for (int i = 0; i < rest.length(); i++) {
+                                char c = rest.charAt(i);
+                                if (c == ' ' || c == ',') { end = i; break; }
+                            }
+                            String dir = rest.substring(0, end);
+                            completeListing(dir, "failed");
+                        }
+                        break;
+                    }
+                    default:
+                        // not a listing event
+                }
+            } catch (Exception e) {
+                LOG.warn("Error processing event type={} msg={}", type, msg, e);
+            }
+        }
+
+        @Override
+        public void streamClosed(Stream stream) {
+            LOG.info("Stream {} closed", stream.getName());
+        }
+    }
+
+    /**
+     * Build the final ListFilesResponse for a completed (or failed)
+     * listing, move it into the cache, and notify monitors.
+     */
+    private void completeListing(String dir, String state) {
+        ListingAccumulator acc = inProgressListings.remove(dir);
+        if (acc == null) {
+            LOG.debug("completeListing({}): no accumulator (listing not ours?)", dir);
+            return;
+        }
+        ListFilesResponse response = acc.build(state);
+        fileListCache.put(dir, response);
+        LOG.info("Listing of {} {}: {} entries",
+                dir, state, response.getFilesCount());
+        notifyRemoteFileListMonitors(response);
+    }
+
+    /**
+     * Collects file and subdirectory entries for a single in-progress
+     * directory listing. Flipped to a ListFilesResponse when the
+     * terminal event arrives.
+     */
+    private static final class ListingAccumulator {
+        private final String dirName;
+        private final List<RemoteFile> entries = new ArrayList<>();
+        private final long startMs = System.currentTimeMillis();
+
+        ListingAccumulator(String dirName) {
+            this.dirName = dirName;
+        }
+
+        synchronized void addFile(String name, long size) {
+            entries.add(RemoteFile.newBuilder()
+                    .setName(name)
+                    .setIsDirectory(false)
+                    .setSize(size)
+                    .build());
+        }
+
+        synchronized void addSubdir(String name) {
+            entries.add(RemoteFile.newBuilder()
+                    .setName(name)
+                    .setIsDirectory(true)
+                    .setSize(0)
+                    .build());
+        }
+
+        synchronized ListFilesResponse build(String state) {
+            long nowMs = System.currentTimeMillis();
+            return ListFilesResponse.newBuilder()
+                    .setRemotePath(dirName)
+                    .setDestination("spacecraft")
+                    .setState(state)
+                    .setListTime(Timestamp.newBuilder()
+                            .setSeconds(nowMs / 1000)
+                            .setNanos((int) ((nowMs % 1000) * 1_000_000))
+                            .build())
+                    .addAllFiles(entries)
+                    .build();
+        }
     }
 
     // ----------------------------------------------------------------------
@@ -421,6 +675,7 @@ public class FprimeFilePacketService extends AbstractFileTransferService impleme
             if (processor != null) {
                 this.commandingManager = processor.getCommandingManager();
                 this.fileDownlinkCommand = processor.getMdb().getMetaCommand(fileDownlinkCommandName);
+                this.listDirectoryCommand = processor.getMdb().getMetaCommand(listDirectoryCommandName);
                 this.systemUser = YamcsServer.getServer().getSecurityStore().getSystemUser();
                 if (fileDownlinkCommand == null) {
                     LOG.warn("File downlink command '{}' not found in MDB; "
@@ -430,8 +685,29 @@ public class FprimeFilePacketService extends AbstractFileTransferService impleme
                     LOG.info("Downlink trigger resolved: {} via processor {}",
                             fileDownlinkCommandName, processor.getName());
                 }
+                if (listDirectoryCommand == null) {
+                    LOG.warn("ListDirectory command '{}' not found in MDB; "
+                            + "fetchFileList will fail", listDirectoryCommandName);
+                } else {
+                    LOG.info("File listing trigger resolved: {}", listDirectoryCommandName);
+                }
             } else {
-                LOG.warn("No processor available; downlink will be disabled");
+                LOG.warn("No processor available; downlink and listing disabled");
+            }
+
+            // --- Events stream subscription (for remote file listings) ---
+            // fprime-yamcs-events publishes decoded F´ events into the
+            // events_realtime stream. Each tuple has a 'body' column
+            // containing an org.yamcs.protobuf.Event protobuf. We filter
+            // by event type and regex-parse the message field to drive
+            // the listing state machine.
+            this.eventsStream = yarch.getStream("events_realtime");
+            if (eventsStream != null) {
+                eventsStream.addSubscriber(new EventTupleSubscriber());
+                LOG.info("Subscribed to events_realtime for remote file listings");
+            } else {
+                LOG.warn("events_realtime stream not found; fetchFileList will not "
+                        + "be able to collect results");
             }
 
             LOG.info("FprimeFilePacketService started: subscribed to {}, "
