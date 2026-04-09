@@ -22,10 +22,12 @@ import org.yamcs.InitException;
 import org.yamcs.Spec;
 import org.yamcs.Spec.OptionType;
 import org.yamcs.YConfiguration;
+import org.yamcs.Processor;
 import org.yamcs.YamcsServer;
 import org.yamcs.YamcsServerInstance;
 import org.yamcs.buckets.Bucket;
 import org.yamcs.buckets.BucketManager;
+import org.yamcs.commanding.CommandingManager;
 import org.yamcs.commanding.PreparedCommand;
 import org.yamcs.filetransfer.AbstractFileTransferService;
 import org.yamcs.filetransfer.FileTransfer;
@@ -38,6 +40,8 @@ import org.yamcs.protobuf.EntityInfo;
 import org.yamcs.protobuf.FileTransferCapabilities;
 import org.yamcs.protobuf.TransferDirection;
 import org.yamcs.protobuf.TransferState;
+import org.yamcs.security.User;
+import org.yamcs.xtce.MetaCommand;
 import org.yamcs.tctm.Link;
 import org.yamcs.tctm.ccsds.TcPacketHandler;
 import org.yamcs.tctm.ccsds.error.CrcCciitCalculator;
@@ -150,6 +154,11 @@ public class FprimeFilePacketService extends AbstractFileTransferService impleme
     private int spacecraftId;
     private int vcId;
 
+    // Configuration — downlink
+    private String fileDownlinkCommandName;
+    private String sourceFileNameArg;
+    private String destFileNameArg;
+
     // Runtime — downlink
     private Stream inStream;
     private Bucket bucket;
@@ -180,6 +189,20 @@ public class FprimeFilePacketService extends AbstractFileTransferService impleme
     private final Map<Long, FprimeFileTransfer> transfers = new ConcurrentHashMap<>();
     private final List<TransferMonitor> transferMonitors = new CopyOnWriteArrayList<>();
 
+    // Downlink routing: pending download transfers are keyed by the
+    // destination path F´ will emit in the FileDownlink Start packet
+    // (i.e. the bucket object name we asked F´ to use). When the Start
+    // arrives, handleStart() looks up the pending transfer by that path
+    // and attaches it to the reassembly so progress / completion flow
+    // back to the REST/UI layer.
+    private final Map<String, FprimeFileTransfer> pendingDownloadsByPath = new ConcurrentHashMap<>();
+
+    // Resolved at doStart for downlink command synthesis.
+    private Processor processor;
+    private CommandingManager commandingManager;
+    private MetaCommand fileDownlinkCommand;  // may be null if not in MDB
+    private User systemUser;
+
     // In-flight downlink transfer state. v0 supports one transfer at a time.
     // null means idle.
     private Transfer inflight;
@@ -191,6 +214,10 @@ public class FprimeFilePacketService extends AbstractFileTransferService impleme
         final int declaredSize;
         int bytesReceived;
         int lastSeqIndex;
+        // Optional API-level transfer — non-null when this downlink was
+        // triggered by a startDownload() call, letting handleData/handleEnd
+        // push progress and completion state back to the REST/UI layer.
+        FprimeFileTransfer apiTransfer;
 
         Transfer(String src, String dst, int size, int startSeq) {
             this.sourcePath = src;
@@ -221,6 +248,15 @@ public class FprimeFilePacketService extends AbstractFileTransferService impleme
         spec.addOption("uplinkChunkSize", OptionType.INTEGER).withDefault(128);
         spec.addOption("spacecraftId", OptionType.INTEGER).withDefault(68);
         spec.addOption("vcId", OptionType.INTEGER).withDefault(1);
+        // Downlink: qualified name of the F´ command that triggers a
+        // FileDownlink on the spacecraft, plus the names of its source
+        // and destination path arguments.
+        spec.addOption("fileDownlinkCommand", OptionType.STRING).withDefault(
+                "/FprimeYamcsReference|YamcsDeployment/FileHandling|fileDownlink|SendFile");
+        spec.addOption("sourceFileNameArg", OptionType.STRING).withDefault(
+                "FileHandling|fileDownlink|SendFile|sourceFileName");
+        spec.addOption("destFileNameArg", OptionType.STRING).withDefault(
+                "FileHandling|fileDownlink|SendFile|destFileName");
         return spec;
     }
 
@@ -236,6 +272,12 @@ public class FprimeFilePacketService extends AbstractFileTransferService impleme
         this.uplinkChunkSize = config.getInt("uplinkChunkSize", 128);
         this.spacecraftId = config.getInt("spacecraftId", 68);
         this.vcId = config.getInt("vcId", 1);
+        this.fileDownlinkCommandName = config.getString("fileDownlinkCommand",
+                "/FprimeYamcsReference|YamcsDeployment/FileHandling|fileDownlink|SendFile");
+        this.sourceFileNameArg = config.getString("sourceFileNameArg",
+                "FileHandling|fileDownlink|SendFile|sourceFileName");
+        this.destFileNameArg = config.getString("destFileNameArg",
+                "FileHandling|fileDownlink|SendFile|destFileName");
 
         LOG.info("FprimeFilePacketService init: inStream={} bucket={} fileApid={}"
                 + " uplinkLink={} fprime={}:{} chunk={}B scid={} vcid={}",
@@ -250,8 +292,10 @@ public class FprimeFilePacketService extends AbstractFileTransferService impleme
     @Override
     protected void addCapabilities(FileTransferCapabilities.Builder b) {
         b.setUpload(true)          // operators can push files to F´
-         .setDownload(false)       // downlink is F´-initiated, not YAMCS-initiated
-         .setRemotePath(true)      // uplinks can target arbitrary F´ paths
+         .setDownload(true)        // operators can pull files from F´ (by
+                                   // synthesizing an F´ FileDownlink.SendFile
+                                   // command under the hood)
+         .setRemotePath(true)      // paths on either side are arbitrary
          .setFileList(false)       // no remote file listing
          .setHasTransferType(false)
          .setPauseResume(false);
@@ -371,6 +415,25 @@ public class FprimeFilePacketService extends AbstractFileTransferService impleme
                 return t;
             });
 
+            // --- Downlink command synthesis setup ---
+            YamcsServerInstance ysi = YamcsServer.getServer().getInstance(yamcsInstance);
+            this.processor = ysi.getFirstProcessor();
+            if (processor != null) {
+                this.commandingManager = processor.getCommandingManager();
+                this.fileDownlinkCommand = processor.getMdb().getMetaCommand(fileDownlinkCommandName);
+                this.systemUser = YamcsServer.getServer().getSecurityStore().getSystemUser();
+                if (fileDownlinkCommand == null) {
+                    LOG.warn("File downlink command '{}' not found in MDB; "
+                            + "startDownload() will fail with InvalidRequestException",
+                            fileDownlinkCommandName);
+                } else {
+                    LOG.info("Downlink trigger resolved: {} via processor {}",
+                            fileDownlinkCommandName, processor.getName());
+                }
+            } else {
+                LOG.warn("No processor available; downlink will be disabled");
+            }
+
             LOG.info("FprimeFilePacketService started: subscribed to {}, "
                     + "ready for file transfers via YAMCS FileTransferService API",
                     inStreamName);
@@ -475,6 +538,7 @@ public class FprimeFilePacketService extends AbstractFileTransferService impleme
     private void handleStart(byte[] bytes, int offset, int seqIndex) {
         if (inflight != null) {
             LOG.warn("Got T_START while transfer in progress; dropping previous");
+            failInflight("superseded by new T_START");
         }
         ByteBuffer bb = ByteBuffer.wrap(bytes);
         int fileSize = bb.getInt(offset);
@@ -487,6 +551,29 @@ public class FprimeFilePacketService extends AbstractFileTransferService impleme
         LOG.info("File transfer START: seq={} size={} src={} dst={}",
                 seqIndex, fileSize, src, dst);
         inflight = new Transfer(src, dst, fileSize, seqIndex);
+
+        // Link an API-level transfer record if one is present. Two cases:
+        //   (a) This downlink was requested via startDownload(), so a
+        //       transfer is already waiting in pendingDownloadsByPath.
+        //   (b) This is an unsolicited downlink (command stack / REST
+        //       triggered FileDownlink.SendFile directly). We create a
+        //       fresh transfer on the fly so it still appears in the
+        //       File Transfer UI alongside operator-initiated downlinks.
+        FprimeFileTransfer api = pendingDownloadsByPath.remove(dst);
+        if (api == null) {
+            long id = transferIdSeq.getAndIncrement();
+            api = new FprimeFileTransfer(id, bucketName, dst, src,
+                    fileSize, TransferDirection.DOWNLOAD);
+            api.setStartTime(System.currentTimeMillis());
+            transfers.put(id, api);
+            LOG.info("Unsolicited downlink; created transfer record id={}", id);
+        } else {
+            // Update the totalSize now that we know it from the Start packet.
+            api.setTotalSize(fileSize);
+        }
+        api.setState(TransferState.RUNNING);
+        inflight.apiTransfer = api;
+        notifyStateChanged(api);
     }
 
     private void handleData(byte[] bytes, int offset, int seqIndex) {
@@ -502,13 +589,18 @@ public class FprimeFilePacketService extends AbstractFileTransferService impleme
         if (byteOffset + dataSize > inflight.declaredSize) {
             LOG.error("DATA packet would overflow file: byteOffset={} dataSize={} declared={}",
                     byteOffset, dataSize, inflight.declaredSize);
-            inflight = null;
+            failInflight("overflow in DATA packet");
             return;
         }
 
         System.arraycopy(bytes, dataStart, inflight.reassemblyBuffer, byteOffset, dataSize);
         inflight.bytesReceived += dataSize;
         inflight.lastSeqIndex = seqIndex;
+
+        if (inflight.apiTransfer != null) {
+            inflight.apiTransfer.setTransferredSize(inflight.bytesReceived);
+            notifyStateChanged(inflight.apiTransfer);
+        }
     }
 
     private void handleEnd(byte[] bytes, int offset, int seqIndex) {
@@ -525,7 +617,9 @@ public class FprimeFilePacketService extends AbstractFileTransferService impleme
                     inflight.destinationPath,
                     Integer.toHexString(receivedChecksum),
                     Integer.toHexString(computed));
-            inflight = null;
+            failInflight(String.format(
+                    "checksum mismatch: expected 0x%08x got 0x%08x",
+                    receivedChecksum, computed));
             return;
         }
 
@@ -542,8 +636,15 @@ public class FprimeFilePacketService extends AbstractFileTransferService impleme
                     Map.of(), inflight.reassemblyBuffer).join();
             LOG.info("File transfer COMPLETE: {} ({} bytes) -> bucket {}",
                     objectName, inflight.bytesReceived, bucketName);
+            if (inflight.apiTransfer != null) {
+                inflight.apiTransfer.setTransferredSize(inflight.bytesReceived);
+                inflight.apiTransfer.setState(TransferState.COMPLETED);
+                notifyStateChanged(inflight.apiTransfer);
+            }
         } catch (Exception e) {
             LOG.error("Failed to store file in bucket", e);
+            failInflight("bucket write failed: " + e.getMessage());
+            return;
         } finally {
             inflight = null;
         }
@@ -553,10 +654,27 @@ public class FprimeFilePacketService extends AbstractFileTransferService impleme
         if (inflight != null) {
             LOG.warn("File transfer CANCELLED at seq {} (was: {})",
                     seqIndex, inflight.destinationPath);
-            inflight = null;
+            failInflight("cancelled by spacecraft");
         } else {
             LOG.warn("Got T_CANCEL seq={} with no in-flight transfer", seqIndex);
         }
+    }
+
+    /**
+     * Mark the in-flight downlink as failed, push the failure to its API
+     * transfer if linked, and clear {@link #inflight}. Used by every error
+     * path in the downlink state machine.
+     */
+    private void failInflight(String reason) {
+        if (inflight == null) {
+            return;
+        }
+        if (inflight.apiTransfer != null) {
+            inflight.apiTransfer.setFailureReason(reason);
+            inflight.apiTransfer.setState(TransferState.FAILED);
+            notifyStateChanged(inflight.apiTransfer);
+        }
+        inflight = null;
     }
 
     // ----------------------------------------------------------------------
@@ -625,13 +743,80 @@ public class FprimeFilePacketService extends AbstractFileTransferService impleme
     @Override
     public FileTransfer startDownload(String sourceEntity, String sourcePath,
                                       String destEntity, Bucket destBucket,
-                                      String destPath, TransferOptions options) {
-        // Downlink is spacecraft-initiated: operators run F´'s
-        // FileDownlink.SendFile command from the YAMCS command stack and
-        // our tm_realtime subscriber reassembles the result. This
-        // endpoint exists for API completeness but is not implemented.
-        throw new UnsupportedOperationException(
-                "startDownload not yet implemented; issue FileDownlink.SendFile command instead");
+                                      String destPath, TransferOptions options)
+            throws IOException {
+        // Parameter order per YAMCS FileTransferApi.createTransfer bytecode
+        // matches startUpload with sourcePath/remotePath rather than
+        // a bucket object name.
+        //   sourceEntity : remote entity name ("spacecraft")
+        //   sourcePath   : path on the spacecraft to fetch (e.g. "README.md")
+        //   destEntity   : local entity name ("ground")
+        //   destBucket   : bucket to deposit the received file in
+        //   destPath     : bucket object name to store it under
+        //
+        // v0 implementation: synthesize an F´ FileDownlink.SendFile command
+        // with (sourceFileName=sourcePath, destFileName=destPath) and send
+        // it through the configured processor's commanding manager. F´ will
+        // emit Fw::FilePacket frames; our existing handleStart/handleData/
+        // handleEnd pipeline reassembles them and writes to `destBucket`.
+        // We cross-reference the two halves by `destPath` — the same string
+        // appears in the Start packet's destinationPath field.
+        if (fileDownlinkCommand == null) {
+            throw new InvalidRequestException("Downlink command '"
+                    + fileDownlinkCommandName + "' not found in MDB");
+        }
+        if (sourcePath == null || sourcePath.isEmpty()) {
+            throw new InvalidRequestException("sourcePath (file on spacecraft) is required");
+        }
+        if (destBucket == null) {
+            throw new InvalidRequestException("destBucket is required");
+        }
+        if (destPath == null || destPath.isEmpty()) {
+            // Default to the basename of the source path, so operators can
+            // leave the destination blank in the UI.
+            destPath = sourcePath.contains("/")
+                    ? sourcePath.substring(sourcePath.lastIndexOf('/') + 1)
+                    : sourcePath;
+        }
+
+        long id = transferIdSeq.getAndIncrement();
+        FprimeFileTransfer transfer = new FprimeFileTransfer(
+                id,
+                destBucket.getName(),
+                destPath,           // bucket object name when it lands
+                sourcePath,         // path on F´ we requested
+                -1,                 // total size unknown until Start packet arrives
+                TransferDirection.DOWNLOAD);
+        transfer.setStartTime(System.currentTimeMillis());
+        transfers.put(id, transfer);
+        pendingDownloadsByPath.put(destPath, transfer);
+        notifyStateChanged(transfer);
+
+        // Build and dispatch the F´ SendFile command on behalf of the user.
+        try {
+            Map<String, Object> args = new java.util.HashMap<>();
+            args.put(sourceFileNameArg, sourcePath);
+            args.put(destFileNameArg, destPath);
+            PreparedCommand pc = commandingManager.buildCommand(
+                    fileDownlinkCommand, args,
+                    "FprimeFilePacketService",
+                    (int) (id & 0x7FFFFFFF),
+                    systemUser);
+            commandingManager.sendCommand(systemUser, pc);
+            LOG.info("Downlink START: id={} source={} (on F´) -> bucket {}/{}",
+                    id, sourcePath, destBucket.getName(), destPath);
+        } catch (Exception e) {
+            // Command dispatch failed — mark the transfer failed and
+            // clean up the pending map.
+            LOG.error("Failed to dispatch FileDownlink command for transfer {}", id, e);
+            pendingDownloadsByPath.remove(destPath, transfer);
+            transfer.setFailureReason("command dispatch: " + e.getMessage());
+            transfer.setState(TransferState.FAILED);
+            notifyStateChanged(transfer);
+            throw new IOException("Failed to dispatch downlink command", e);
+        }
+
+        return transfer;
     }
 
     @Override
@@ -759,7 +944,7 @@ public class FprimeFilePacketService extends AbstractFileTransferService impleme
         private final String bucketName;
         private final String objectName;
         private final String remotePath;
-        private final long totalSize;
+        private volatile long totalSize;
         private final TransferDirection direction;
         private final long creationTime = System.currentTimeMillis();
 
@@ -798,6 +983,7 @@ public class FprimeFilePacketService extends AbstractFileTransferService impleme
 
         void setStartTime(long t) { this.startTime = t; }
         void setTransferredSize(long n) { this.transferredSize = n; }
+        void setTotalSize(long n) { this.totalSize = n; }
         void setState(TransferState s) { this.state = s; }
         void setFailureReason(String r) { this.failureReason = r; }
     }
