@@ -41,10 +41,12 @@ protocol translation).
    ```sh
    pip install -r requirements.txt
    ```
-5. Apply the `fprime-xtce` patch for `Fw::FilePacket` container
-   support. Until [the patch lands upstream][xtce-pr], copy the two
-   patched files from `dict-additions/fprime_xtce_patch/` into your
-   venv:
+5. Apply the two upstream patches that aren't landed yet. Both follow
+   the same pattern — vendored copies in `dict-additions/` that overwrite
+   the matching files in the venv install.
+
+   **`fprime-xtce` patch** — adds `Fw::FilePacket` container generation
+   to the XTCE dictionary. Until [the patch lands upstream][xtce-pr]:
    ```sh
    cp dict-additions/fprime_xtce_patch/primitive_types.py \
       fprime-venv/lib/python3.11/site-packages/fprime_xtce/
@@ -52,7 +54,17 @@ protocol translation).
       fprime-venv/lib/python3.11/site-packages/fprime_xtce/
    ```
 
+   **`fprime-yamcs-events` patch** — one-line fix that propagates F´
+   event arguments through to `Event.extra` (without it, our service
+   falls back to regex-parsing event message strings, which works but
+   is less robust). Until [the patch lands upstream][events-pr]:
+   ```sh
+   cp dict-additions/fprime_yamcs_events_patch/processor.py \
+      fprime-venv/lib/python3.11/site-packages/fprime_yamcs/events/
+   ```
+
 [xtce-pr]: https://github.com/fprime-community/fprime-xtce
+[events-pr]: https://github.com/fprime-community/fprime-yamcs
 
 ## Building F´
 
@@ -165,6 +177,16 @@ the real F´ binary:
   uplink.
 - **L4 — Real F´ binary end-to-end.** Procedure documented in
   [`tools/l4_real_fprime_test.md`](tools/l4_real_fprime_test.md).
+- **L4 edge cases — automated suite.** 9 boundary-condition cases
+  (empty, single-byte, exact chunk, chunk+1, exact N×chunk, multi-chunk
+  small, multi-chunk big, sequential_a, sequential_b). Each case uploads
+  to F´ and downloads back via the native REST API, verifying sha256.
+  Runs in ~20 seconds. See [`tools/l4_edge_cases.py`](tools/l4_edge_cases.py).
+  Run with:
+  ```sh
+  python3 tools/l4_edge_cases.py
+  ```
+  Prints a one-line PASS/FAIL per case and an overall summary.
 
 The full testing strategy, including property tests and what each
 layer does or doesn't catch, is in the
@@ -189,11 +211,17 @@ FprimeYamcsReference/
 docs/file-transfer-integration.md   design doc (read this first)
 
 dict-additions/
-  fprime_xtce_patch/      patched primitive_types.py and
+  fprime_xtce_patch/      patched primitive_types.py +
                           primitive_containers.py that teach
                           fprime-to-xtce about Fw::FilePacket.
-                          Apply to the venv install until the
-                          upstream PR lands.
+                          Apply to the venv until the upstream PR
+                          lands.
+  fprime_yamcs_events_patch/
+                          one-line patched processor.py that
+                          propagates F´ event arguments through as
+                          Event.extra instead of discarding them.
+                          Apply to the venv until the upstream PR
+                          lands.
 
 tools/
   fprime_filepacket/      Python wire-format codec for Fw::FilePacket
@@ -204,6 +232,10 @@ tools/
   l3_fake_spacecraft.py   send canned files at YAMCS as TM frames
   l3_uplink_harness.py    send canned files at F´ as TC frames
   l4_real_fprime_test.md  end-to-end procedure with the real binary
+  l4_edge_cases.py        9-case boundary test suite (empty, exact
+                          chunk, chunk+1, multi-chunk, sequential…),
+                          round-trips each case upload→download via
+                          the native REST API and verifies sha256
 
 lib/fprime/               F´ framework submodule
 ```
@@ -227,11 +259,22 @@ lib/fprime/               F´ framework submodule
   to `events_realtime` must use `org.yamcs.yarch.protobuf.Db.Event`,
   not `org.yamcs.protobuf.Event`. They have identical getters but
   are wire-incompatible.
-- **Regex-parsed event args.** `fprime-yamcs-events` publishes F´
-  events with the structured arg map discarded (only the rendered
-  message string survives). The file listing code regex-parses that
-  message to recover file names and sizes. A one-line upstream
-  patch would let us use `Event.getExtra()` instead.
+- **Regex fallback for event args when the fprime-yamcs-events patch
+  isn't applied.** Unpatched `fprime-yamcs-events` discards event
+  argument dicts before calling `send_event`, so the published YAMCS
+  `Event.extra` map is empty. The service's file-listing code prefers
+  `Event.getExtra()` when populated but falls back to regex-parsing
+  the message string for compatibility. Apply the patch from
+  `dict-additions/fprime_yamcs_events_patch/` (setup step 5) to take
+  the structured-args path.
+- **F´ `Svc::FileDownlink` refuses zero-byte source files.** It emits
+  a `DownlinkPartialFail: Offset 0 greater than or equal to source
+  filesize 0` event when asked to downlink an empty file. Uploading
+  a zero-byte file via our service works — F´ `FileUplink` accepts a
+  Start + End sequence with no Data packets and writes a real empty
+  file to disk — but the inverse isn't possible until F´ is patched.
+  The edge-case test suite documents this case with an upload-only
+  verification and a skip-download note.
 
 ## Related PRs
 
@@ -239,3 +282,8 @@ lib/fprime/               F´ framework submodule
   generator. Branch pushed to the author's fork at
   `yudataguy/fprime-xtce:feat/fw-filepacket-containers`, ready for PR
   against `fprime-community/fprime-xtce:main`.
+- **`fprime-yamcs`** — one-line fix to `fprime-yamcs-events`'s
+  processor.py that propagates F´ event arguments through as
+  `Event.extra`. Branch pushed to the author's fork at
+  `yudataguy/fprime-yamcs:feat/publish-event-args`, ready for PR
+  against `fprime-community/fprime-yamcs:main`.
