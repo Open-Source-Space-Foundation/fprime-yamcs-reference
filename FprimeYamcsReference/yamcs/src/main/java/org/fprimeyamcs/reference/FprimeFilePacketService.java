@@ -1,9 +1,6 @@
 package org.fprimeyamcs.reference;
 
 import java.io.IOException;
-import java.net.DatagramPacket;
-import java.net.DatagramSocket;
-import java.net.InetAddress;
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
@@ -59,7 +56,6 @@ import org.yamcs.security.User;
 import org.yamcs.xtce.MetaCommand;
 import org.yamcs.tctm.Link;
 import org.yamcs.tctm.ccsds.TcPacketHandler;
-import org.yamcs.tctm.ccsds.error.CrcCciitCalculator;
 import org.yamcs.yarch.Stream;
 import org.yamcs.yarch.StreamSubscriber;
 import org.yamcs.yarch.Tuple;
@@ -124,11 +120,7 @@ import org.yamcs.yarch.YarchDatabaseInstance;
  *       bucket: fprimeFilesIn          # incoming bucket
  *       fileApid: 3                    # default; FW_PACKET_FILE
  *       uplinkLink: UDP_TC_OUT.vc1     # YAMCS TC link to route through
- *       fprimeHost: 127.0.0.1          # direct-UDP fallback only
- *       fprimeTcPort: 50001            # direct-UDP fallback only
  *       uplinkChunkSize: 128           # bytes per Fw::FilePacket DataPacket
- *       spacecraftId: 68               # must match F´ ComCfg
- *       vcId: 1
  * </pre>
  */
 public class FprimeFilePacketService extends AbstractFileTransferService implements StreamSubscriber {
@@ -162,12 +154,8 @@ public class FprimeFilePacketService extends AbstractFileTransferService impleme
     private int fileApid;
 
     // Configuration — uplink
-    private String uplinkLinkName;  // null/empty => direct UDP fallback
-    private String fprimeHost;
-    private int fprimeTcPort;
+    private String uplinkLinkName;
     private int uplinkChunkSize;
-    private int spacecraftId;
-    private int vcId;
 
     // Configuration — downlink
     private String fileDownlinkCommandName;
@@ -178,19 +166,13 @@ public class FprimeFilePacketService extends AbstractFileTransferService impleme
     private Stream inStream;
     private Bucket bucket;
 
-    // Runtime — uplink
-    // The two uplink transports. Exactly one is active per run depending on
-    // whether uplinkLinkName resolves to a TcPacketHandler at doStart time.
-    // Step 2 path: route through the YAMCS-configured TC data link.
+    // Runtime — uplink. Each uplinked FilePacket becomes a synthetic
+    // PreparedCommand handed to this TC data link, which runs the
+    // FprimeCommandPostprocessor and emits a CCSDS TC Type-BD frame.
     private TcPacketHandler uplinkLink;
-    // Step 1 path: open our own UDP socket directly to F´. Only used if
-    // the YAMCS link is unavailable (e.g. tests, misconfiguration).
-    private DatagramSocket uplinkSocket;
-    private InetAddress fprimeAddr;
-    private final CrcCciitCalculator crc = new CrcCciitCalculator();
-    // Space packet sequence counter. Only used on the direct-UDP fallback
-    // path; on the YAMCS-link path the FprimeCommandPostprocessor fills it.
-    private int uplinkSpSeq = 0;
+    // Synthetic CommandId sequence counter. Each uplinked packet gets
+    // a unique sequenceNumber so command history distinguishes them.
+    private int uplinkCmdSeq = 0;
 
     // Entity ids for the FileTransferService interface. Values are
     // arbitrary — YAMCS only requires them to be unique within the
@@ -283,15 +265,11 @@ public class FprimeFilePacketService extends AbstractFileTransferService impleme
         spec.addOption("inStream", OptionType.STRING).withDefault("tm_realtime");
         spec.addOption("bucket", OptionType.STRING).withDefault("fprimeFilesIn");
         spec.addOption("fileApid", OptionType.INTEGER).withDefault(DEFAULT_FILE_APID);
-        // Step 2 default: route uplink through the YAMCS-configured TC
-        // data link (inherits postprocessor, link stats, transport swap).
-        // Set to empty string to force the direct-UDP fallback.
+        // Route uplink through the YAMCS-configured TC data link. The
+        // service expects this link name to resolve to a TcPacketHandler
+        // and fails to start otherwise.
         spec.addOption("uplinkLink", OptionType.STRING).withDefault("UDP_TC_OUT.vc1");
-        spec.addOption("fprimeHost", OptionType.STRING).withDefault("127.0.0.1");
-        spec.addOption("fprimeTcPort", OptionType.INTEGER).withDefault(50001);
         spec.addOption("uplinkChunkSize", OptionType.INTEGER).withDefault(128);
-        spec.addOption("spacecraftId", OptionType.INTEGER).withDefault(68);
-        spec.addOption("vcId", OptionType.INTEGER).withDefault(1);
         // Downlink: qualified name of the F´ command that triggers a
         // FileDownlink on the spacecraft, plus the names of its source
         // and destination path arguments.
@@ -316,11 +294,7 @@ public class FprimeFilePacketService extends AbstractFileTransferService impleme
         this.bucketName = config.getString("bucket", "fprimeFilesIn");
         this.fileApid = config.getInt("fileApid", DEFAULT_FILE_APID);
         this.uplinkLinkName = config.getString("uplinkLink", "UDP_TC_OUT.vc1");
-        this.fprimeHost = config.getString("fprimeHost", "127.0.0.1");
-        this.fprimeTcPort = config.getInt("fprimeTcPort", 50001);
         this.uplinkChunkSize = config.getInt("uplinkChunkSize", 128);
-        this.spacecraftId = config.getInt("spacecraftId", 68);
-        this.vcId = config.getInt("vcId", 1);
         this.fileDownlinkCommandName = config.getString("fileDownlinkCommand",
                 "/FprimeYamcsReference|YamcsDeployment/FileHandling|fileDownlink|SendFile");
         this.sourceFileNameArg = config.getString("sourceFileNameArg",
@@ -333,9 +307,8 @@ public class FprimeFilePacketService extends AbstractFileTransferService impleme
                 "FileHandling|fileManager|ListDirectory|dirName");
 
         LOG.info("FprimeFilePacketService init: inStream={} bucket={} fileApid={}"
-                + " uplinkLink={} fprime={}:{} chunk={}B scid={} vcid={}",
-                inStreamName, bucketName, fileApid, uplinkLinkName,
-                fprimeHost, fprimeTcPort, uplinkChunkSize, spacecraftId, vcId);
+                + " uplinkLink={} chunk={}B",
+                inStreamName, bucketName, fileApid, uplinkLinkName, uplinkChunkSize);
     }
 
     // ----------------------------------------------------------------------
@@ -666,29 +639,25 @@ public class FprimeFilePacketService extends AbstractFileTransferService impleme
             this.inStream.addSubscriber(this);
 
             // --- Uplink transport resolution ---
-            // Prefer routing via the YAMCS-configured TC data link. Fall
-            // back to a direct UDP socket if the link can't be resolved
-            // as a TcPacketHandler.
-            if (uplinkLinkName != null && !uplinkLinkName.isEmpty()) {
-                YamcsServerInstance instance = YamcsServer.getServer().getInstance(yamcsInstance);
-                Link link = instance.getLinkManager().getLink(uplinkLinkName);
-                if (link instanceof TcPacketHandler) {
-                    this.uplinkLink = (TcPacketHandler) link;
-                    LOG.info("Uplink will route through YAMCS link {} (TcPacketHandler)",
-                            uplinkLinkName);
-                } else if (link == null) {
-                    LOG.warn("Uplink link {} not found; falling back to direct UDP",
-                            uplinkLinkName);
-                } else {
-                    LOG.warn("Uplink link {} is {} (not TcPacketHandler); falling back to direct UDP",
-                            uplinkLinkName, link.getClass().getSimpleName());
-                }
+            // Route via the YAMCS-configured TC data link. This must
+            // resolve to a TcPacketHandler — we fail startup otherwise
+            // because there is no meaningful fallback transport.
+            if (uplinkLinkName == null || uplinkLinkName.isEmpty()) {
+                notifyFailed(new IllegalStateException(
+                        "uplinkLink config option is required"));
+                return;
             }
-            if (this.uplinkLink == null) {
-                this.fprimeAddr = InetAddress.getByName(fprimeHost);
-                this.uplinkSocket = new DatagramSocket();
-                LOG.info("Uplink will send via direct UDP to {}:{}", fprimeHost, fprimeTcPort);
+            YamcsServerInstance instance = YamcsServer.getServer().getInstance(yamcsInstance);
+            Link link = instance.getLinkManager().getLink(uplinkLinkName);
+            if (!(link instanceof TcPacketHandler)) {
+                String what = link == null ? "not found"
+                        : "is " + link.getClass().getSimpleName() + ", not TcPacketHandler";
+                notifyFailed(new IllegalStateException(
+                        "Uplink link '" + uplinkLinkName + "' " + what));
+                return;
             }
+            this.uplinkLink = (TcPacketHandler) link;
+            LOG.info("Uplink will route through YAMCS link {} (TcPacketHandler)", uplinkLinkName);
 
             // Uplink worker: single-threaded so transfers serialize and
             // the space packet sequence counter stays monotonic.
@@ -752,9 +721,6 @@ public class FprimeFilePacketService extends AbstractFileTransferService impleme
     protected void doStop() {
         if (uplinkExecutor != null) {
             uplinkExecutor.shutdownNow();
-        }
-        if (uplinkSocket != null) {
-            uplinkSocket.close();
         }
         if (inStream != null) {
             inStream.removeSubscriber(this);
@@ -1296,45 +1262,36 @@ public class FprimeFilePacketService extends AbstractFileTransferService impleme
     /**
      * Wrap a raw {@code Fw::FilePacket} byte sequence (which already
      * includes the 2-byte ComPacket descriptor prefix) in a CCSDS space
-     * packet on the file APID, then hand it to the configured uplink
-     * path (YAMCS TC data link or direct UDP fallback).
+     * packet on the file APID, then hand it to the YAMCS TC data link
+     * as a synthetic PreparedCommand. The link runs the command
+     * postprocessor (which patches the CCSDS packet length and
+     * sequence count in place), wraps the packet in a TC Type-BD frame
+     * with CRC16 FECF, and emits it via its configured transport.
+     *
+     * <p>The binary we hand in is already a complete CCSDS space
+     * packet with {@code APID = fileApid}, so F´'s {@code fprimeRouter}
+     * dispatches it to {@code Svc::FileUplink}, not {@code CmdDispatcher}.
+     *
+     * <p>We MUST give the PreparedCommand a populated CommandId — the
+     * plain {@code PreparedCommand(byte[])} constructor leaves it null,
+     * and the TC link's {@code MasterChannelFrameMultiplexer} calls
+     * {@code getGenerationTime()} on the queued command from a
+     * background thread and NPEs otherwise. The command name field is
+     * a free-form string as far as {@code sendCommand()} is concerned;
+     * dictionary lookup only happens on the stream-tuple round-trip
+     * path, which we bypass.
      */
     private void sendFilePacket(byte[] innerWithDescriptor) throws Exception {
-        byte[] spacePacket = buildSpacePacket(innerWithDescriptor, uplinkSpSeq++);
-        if (uplinkLink != null) {
-            // Step-2 path: hand the packet to YAMCS's TC link. The link
-            // will run the FprimeCommandPostprocessor (which patches the
-            // CCSDS packet length and sequence count in place), wrap the
-            // result in a TC Type-BD frame with CRC16 FECF, and send via
-            // its configured UDP socket.
-            //
-            // The binary we provide is already a complete CCSDS space
-            // packet with APID=fileApid, so F´'s fprimeRouter will
-            // dispatch it to FileUplink, not CmdDispatcher.
-            //
-            // We MUST give the PreparedCommand a populated CommandId — the
-            // plain byte[] constructor leaves it null, and the TC link's
-            // MasterChannelFrameMultiplexer calls getGenerationTime() on
-            // the queued command and NPEs otherwise. The command name
-            // field is a free-form string as far as sendCommand() is
-            // concerned; it only becomes dictionary-validated if the
-            // command goes through PreparedCommand.fromTuple(), which we
-            // bypass by calling sendCommand() directly.
-            CommandId cmdId = CommandId.newBuilder()
-                    .setGenerationTime(System.currentTimeMillis())
-                    .setOrigin("FprimeFilePacketService")
-                    .setSequenceNumber(uplinkSpSeq)
-                    .setCommandName("FprimeFilePacketService/uplinkFilePacket")
-                    .build();
-            PreparedCommand pc = new PreparedCommand(cmdId);
-            pc.setBinary(spacePacket);
-            uplinkLink.sendCommand(pc);
-        } else {
-            // Step-1 fallback: build the TC frame ourselves and send
-            // directly via UDP.
-            byte[] frame = buildTcFrame(spacePacket);
-            uplinkSocket.send(new DatagramPacket(frame, frame.length, fprimeAddr, fprimeTcPort));
-        }
+        byte[] spacePacket = buildSpacePacket(innerWithDescriptor, 0);
+        CommandId cmdId = CommandId.newBuilder()
+                .setGenerationTime(System.currentTimeMillis())
+                .setOrigin("FprimeFilePacketService")
+                .setSequenceNumber(uplinkCmdSeq++)
+                .setCommandName("FprimeFilePacketService/uplinkFilePacket")
+                .build();
+        PreparedCommand pc = new PreparedCommand(cmdId);
+        pc.setBinary(spacePacket);
+        uplinkLink.sendCommand(pc);
         // Give F´'s frame accumulator a moment to drain between frames.
         try {
             Thread.sleep(20);
@@ -1406,46 +1363,4 @@ public class FprimeFilePacketService extends AbstractFileTransferService impleme
         return bb.array();
     }
 
-    // ----------------------------------------------------------------------
-    // CCSDS TC Type-BD transfer frame builder
-    //
-    // Format (from lib/fprime/Svc/Ccsds/TcDeframer/TcDeframer.cpp:36-49):
-    //   2b  version = 00
-    //   1b  bypass flag = 1  (Type-B — no FARM sequence checking)
-    //   1b  ctrl cmd flag = 0  (Type-D data frame)
-    //   2b  spare = 00
-    //   10b spacecraft id
-    //   6b  virtual channel id
-    //   10b frame length (total bytes - 1)
-    //   8b  frame sequence number (unused for Type-B, 0)
-    //   variable data field
-    //   16b FECF = CRC16-CCITT over [header + data field]
-    // ----------------------------------------------------------------------
-
-    private static final int TC_HEADER_LEN = 5;
-    private static final int TC_TRAILER_LEN = 2;
-
-    private byte[] buildTcFrame(byte[] dataField) {
-        int total = TC_HEADER_LEN + dataField.length + TC_TRAILER_LEN;
-        int lengthField = total - 1;  // "frame length is bytes minus 1"
-
-        byte[] frame = new byte[total];
-        // Word 0: ver(2)=00 | byp(1)=1 | ctrl(1)=0 | spare(2)=00 | scid(10)
-        int word0 = (0 << 14) | (1 << 13) | (0 << 12) | (0 << 10) | (spacecraftId & 0x03FF);
-        frame[0] = (byte) ((word0 >> 8) & 0xFF);
-        frame[1] = (byte) (word0 & 0xFF);
-        // Word 1: vcid(6) | length(10)
-        int word1 = ((vcId & 0x3F) << 10) | (lengthField & 0x03FF);
-        frame[2] = (byte) ((word1 >> 8) & 0xFF);
-        frame[3] = (byte) (word1 & 0xFF);
-        // Word 2: seq (unused for Type-B)
-        frame[4] = 0;
-        // Data field
-        System.arraycopy(dataField, 0, frame, TC_HEADER_LEN, dataField.length);
-        // FECF: CRC16-CCITT over header + data
-        int fecf = crc.compute(frame, 0, TC_HEADER_LEN + dataField.length);
-        frame[total - 2] = (byte) ((fecf >> 8) & 0xFF);
-        frame[total - 1] = (byte) (fecf & 0xFF);
-        return frame;
-    }
 }
