@@ -24,3 +24,9 @@ __pycache__/
 /FprimeYamcsReference/yamcs/target/
 # Uplink test artifacts written to repo root by F´ cwd
 /uplinked_test.txt
+# Test artifacts that land in F´'s cwd during end-to-end test runs
+/FprimeYamcsReference/yamcs/uplinked_test.txt
+/FprimeYamcsReference/yamcs/yamcs_uplinked.txt
+/FprimeYamcsReference/yamcs/step2_uplinked.txt
+/FprimeYamcsReference/yamcs/step3_uplinked.txt
+/FprimeYamcsReference/yamcs/spacecraft
