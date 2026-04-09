@@ -14,6 +14,8 @@ import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CopyOnWriteArraySet;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ExecutorService;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
@@ -161,6 +163,13 @@ public class FprimeFilePacketService extends AbstractFileTransferService impleme
     private String fileDownlinkCommandName;
     private String sourceFileNameArg;
     private String destFileNameArg;
+    // Max wall-clock time a startDownload() transfer may wait in
+    // pendingDownloadsByPath for a Start packet from F´. If the
+    // spacecraft never emits one (command rejected, file missing,
+    // link dropped, etc.) the transfer is flipped to FAILED and
+    // removed from the pending map, instead of hanging forever in
+    // RUNNING state.
+    private long downloadTimeoutMs;
 
     // Runtime — downlink
     private Stream inStream;
@@ -182,6 +191,10 @@ public class FprimeFilePacketService extends AbstractFileTransferService impleme
 
     // FileTransferService runtime state.
     private ExecutorService uplinkExecutor;
+    // Periodic sweeper that flips stuck pending-download transfers to
+    // FAILED. Runs on a separate single-thread scheduler so a slow
+    // uplink can't block timeout enforcement.
+    private ScheduledExecutorService timeoutScheduler;
     private final AtomicLong transferIdSeq = new AtomicLong(1);
     private final Map<Long, FprimeFileTransfer> transfers = new ConcurrentHashMap<>();
     private final List<TransferMonitor> transferMonitors = new CopyOnWriteArrayList<>();
@@ -284,6 +297,12 @@ public class FprimeFilePacketService extends AbstractFileTransferService impleme
                 "/FprimeYamcsReference|YamcsDeployment/FileHandling|fileManager|ListDirectory");
         spec.addOption("listDirDirNameArg", OptionType.STRING).withDefault(
                 "FileHandling|fileManager|ListDirectory|dirName");
+        // How long to wait for F´ to emit a Start packet after we
+        // synthesize a FileDownlink command before flipping the
+        // pending transfer to FAILED. 30 seconds is generous for a
+        // small fleet; increase for links with high RTT or variable
+        // spacecraft schedulability.
+        spec.addOption("downloadTimeoutMs", OptionType.INTEGER).withDefault(30000);
         return spec;
     }
 
@@ -305,6 +324,7 @@ public class FprimeFilePacketService extends AbstractFileTransferService impleme
                 "/FprimeYamcsReference|YamcsDeployment/FileHandling|fileManager|ListDirectory");
         this.listDirDirNameArg = config.getString("listDirDirNameArg",
                 "FileHandling|fileManager|ListDirectory|dirName");
+        this.downloadTimeoutMs = config.getLong("downloadTimeoutMs", 30000L);
 
         LOG.info("FprimeFilePacketService init: inStream={} bucket={} fileApid={}"
                 + " uplinkLink={} chunk={}B",
@@ -667,6 +687,18 @@ public class FprimeFilePacketService extends AbstractFileTransferService impleme
                 return t;
             });
 
+            // Download timeout sweeper: check every 5 seconds for
+            // pending-download transfers that have been waiting too
+            // long for F´'s Start packet and flip them to FAILED.
+            this.timeoutScheduler = Executors.newSingleThreadScheduledExecutor(r -> {
+                Thread t = new Thread(r, "FprimeFilePacketService-timeout");
+                t.setDaemon(true);
+                return t;
+            });
+            this.timeoutScheduler.scheduleWithFixedDelay(
+                    this::sweepPendingDownloadTimeouts,
+                    5, 5, TimeUnit.SECONDS);
+
             // --- Downlink command synthesis setup ---
             YamcsServerInstance ysi = YamcsServer.getServer().getInstance(yamcsInstance);
             this.processor = ysi.getFirstProcessor();
@@ -719,6 +751,9 @@ public class FprimeFilePacketService extends AbstractFileTransferService impleme
 
     @Override
     protected void doStop() {
+        if (timeoutScheduler != null) {
+            timeoutScheduler.shutdownNow();
+        }
         if (uplinkExecutor != null) {
             uplinkExecutor.shutdownNow();
         }
@@ -726,6 +761,45 @@ public class FprimeFilePacketService extends AbstractFileTransferService impleme
             inStream.removeSubscriber(this);
         }
         notifyStopped();
+    }
+
+    /**
+     * Scheduled task: walk {@link #pendingDownloadsByPath} and fail
+     * any transfer whose start time is older than
+     * {@link #downloadTimeoutMs}. Called every 5 seconds on
+     * {@link #timeoutScheduler}.
+     *
+     * <p>Transfers that have already been linked to an inflight
+     * reassembly by {@link #handleStart} are NOT in this map — they
+     * were removed there. This sweeper only catches the "F´ never
+     * responded to our FileDownlink command" case.
+     */
+    private void sweepPendingDownloadTimeouts() {
+        long now = System.currentTimeMillis();
+        // Iterate a snapshot to avoid ConcurrentModificationException
+        // if handleStart is racing to remove entries.
+        for (Map.Entry<String, FprimeFileTransfer> entry :
+                new ArrayList<>(pendingDownloadsByPath.entrySet())) {
+            FprimeFileTransfer t = entry.getValue();
+            long age = now - t.getStartTime();
+            if (age < downloadTimeoutMs) {
+                continue;
+            }
+            // Best-effort atomic remove: if handleStart beat us to it,
+            // remove() returns false and we skip the state change.
+            if (!pendingDownloadsByPath.remove(entry.getKey(), t)) {
+                continue;
+            }
+            LOG.warn("Download timeout: id={} remotePath={} after {} ms — "
+                    + "no Start packet received",
+                    t.getId(), t.getRemotePath(), age);
+            t.setFailureReason(
+                    "timeout after " + age + " ms: F´ did not emit a Start "
+                    + "packet for '" + t.getRemotePath() + "' "
+                    + "(command rejected? file missing? link down?)");
+            t.setState(TransferState.FAILED);
+            notifyStateChanged(t);
+        }
     }
 
     private Bucket getOrCreateBucket(BucketManager bm, String name) throws Exception {
