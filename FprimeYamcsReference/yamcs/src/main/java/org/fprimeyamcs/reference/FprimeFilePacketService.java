@@ -1,21 +1,23 @@
 package org.fprimeyamcs.reference;
 
+import java.io.IOException;
 import java.net.DatagramPacket;
 import java.net.DatagramSocket;
 import java.net.InetAddress;
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
-import java.util.HashSet;
+import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
 import java.util.Map;
-import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.Executors;
-import java.util.concurrent.ScheduledExecutorService;
-import java.util.concurrent.TimeUnit;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.atomic.AtomicLong;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import org.yamcs.AbstractYamcsService;
 import org.yamcs.InitException;
 import org.yamcs.Spec;
 import org.yamcs.Spec.OptionType;
@@ -24,9 +26,18 @@ import org.yamcs.YamcsServer;
 import org.yamcs.YamcsServerInstance;
 import org.yamcs.buckets.Bucket;
 import org.yamcs.buckets.BucketManager;
-import org.yamcs.buckets.ObjectProperties;
 import org.yamcs.commanding.PreparedCommand;
+import org.yamcs.filetransfer.AbstractFileTransferService;
+import org.yamcs.filetransfer.FileTransfer;
+import org.yamcs.filetransfer.FileTransferFilter;
+import org.yamcs.filetransfer.InvalidRequestException;
+import org.yamcs.filetransfer.TransferMonitor;
+import org.yamcs.filetransfer.TransferOptions;
 import org.yamcs.protobuf.Commanding.CommandId;
+import org.yamcs.protobuf.EntityInfo;
+import org.yamcs.protobuf.FileTransferCapabilities;
+import org.yamcs.protobuf.TransferDirection;
+import org.yamcs.protobuf.TransferState;
 import org.yamcs.tctm.Link;
 import org.yamcs.tctm.ccsds.TcPacketHandler;
 import org.yamcs.tctm.ccsds.error.CrcCciitCalculator;
@@ -38,32 +49,44 @@ import org.yamcs.yarch.YarchDatabaseInstance;
 
 /**
  * Handles {@code Fw::FilePacket} file transfer to and from F´ over the
- * {@code FW_PACKET_FILE} (APID 3) channel.
+ * {@code FW_PACKET_FILE} (APID 3) channel, integrating with YAMCS's native
+ * {@link org.yamcs.filetransfer.FileTransferService} interface.
+ *
+ * <p>Because this service implements {@code FileTransferService}, it is
+ * auto-discovered by YAMCS's built-in {@code FileTransferApi} REST endpoints
+ * (see {@code /api/filetransfer/{instance}/services}) and appears in the
+ * stock {@code yamcs-web} File Transfer UI alongside any other configured
+ * file transfer providers (e.g., CFDP). Operators trigger uplinks from the
+ * same UI they'd use for CFDP transfers — no custom REST client, no XTCE
+ * command hand-rolling.
  *
  * <p><b>Downlink</b>: subscribes to a TM stream (default {@code tm_realtime}),
  * filters for the file APID, demuxes by Fw::FilePacket type, reassembles the
  * file, validates the CFDP modular checksum, and writes the complete file
- * into an incoming bucket.
+ * into an incoming bucket. Downlink is driven by the spacecraft (via F´'s
+ * {@code FileDownlink.SendFile} command issued from YAMCS) — the
+ * {@link #startDownload} entry point on this service is not yet implemented.
  *
- * <p><b>Uplink (v0 — bucket-watch, direct UDP)</b>: on a scheduled interval
- * polls an outgoing bucket for new objects. For each object, reads the bytes,
- * generates the {@code Fw::FilePacket} Start/Data/End sequence, wraps each in
- * a CCSDS space packet on the file APID, wraps each space packet in a CCSDS
- * TC Type-BD transfer frame with a CRC16-CCITT FECF trailer, and sends the
- * frames directly via UDP to the F´ binary's TC port — bypassing YAMCS's own
- * TC data link. After a successful send, deletes the object from the bucket.
- *
- * <p>This is a v0 deliberate simplification. A future step will route uplink
- * through a proper YAMCS command so it inherits the command-history /
- * authorization / verifier pipeline. See the "Vision" section of
- * {@code docs/file-transfer-integration.md} (options U1/U2/U3).
+ * <p><b>Uplink</b>: exposed through
+ * {@link #startUpload(String, Bucket, String, String, String, TransferOptions)}
+ * — called by YAMCS when an operator clicks "Upload" in the web UI. The
+ * service reads the specified bucket object, generates an
+ * {@code Fw::FilePacket} Start/Data×N/End sequence, wraps each in a CCSDS
+ * space packet on the file APID, and hands each packet to the YAMCS-
+ * configured TC data link's {@code TcPacketHandler.sendCommand()} API, which
+ * runs the command postprocessor, frames in CCSDS TC, and emits via the
+ * link's configured transport. If the link isn't available, a direct-UDP
+ * fallback path is used.
  *
  * <p>v0 scope limitations:
  * <ul>
  *   <li>One in-flight downlink transfer at a time
- *   <li>One uplink at a time (polling is serial)
- *   <li>No retransmit on either side
- *   <li>Uplink bypasses YAMCS command history; audit lives in service logs
+ *   <li>Uplinks run serially on a single executor thread
+ *   <li>No retransmit on either side (F´ {@code FilePacket} is
+ *       fire-and-forget; this service reflects that)
+ *   <li>No pause / resume / cancel (protocol doesn't support it)
+ *   <li>{@link #startDownload} not yet implemented
+ *   <li>No remote file listing
  * </ul>
  *
  * <p>Wire format reference: {@code lib/fprime/Fw/FilePacket/FilePacket.hpp}
@@ -80,17 +103,16 @@ import org.yamcs.yarch.YarchDatabaseInstance;
  *     args:
  *       inStream: tm_realtime          # default
  *       bucket: fprimeFilesIn          # incoming bucket
- *       outBucket: fprimeFilesOut      # outgoing bucket (uplink queue)
  *       fileApid: 3                    # default; FW_PACKET_FILE
- *       fprimeHost: 127.0.0.1          # F´ TC address
- *       fprimeTcPort: 50001            # F´ TC port
- *       uplinkIntervalMs: 2000         # bucket poll interval
+ *       uplinkLink: UDP_TC_OUT.vc1     # YAMCS TC link to route through
+ *       fprimeHost: 127.0.0.1          # direct-UDP fallback only
+ *       fprimeTcPort: 50001            # direct-UDP fallback only
  *       uplinkChunkSize: 128           # bytes per Fw::FilePacket DataPacket
  *       spacecraftId: 68               # must match F´ ComCfg
  *       vcId: 1
  * </pre>
  */
-public class FprimeFilePacketService extends AbstractYamcsService implements StreamSubscriber {
+public class FprimeFilePacketService extends AbstractFileTransferService implements StreamSubscriber {
 
     private static final Logger LOG = LoggerFactory.getLogger(FprimeFilePacketService.class);
 
@@ -121,11 +143,9 @@ public class FprimeFilePacketService extends AbstractYamcsService implements Str
     private int fileApid;
 
     // Configuration — uplink
-    private String outBucketName;
     private String uplinkLinkName;  // null/empty => direct UDP fallback
     private String fprimeHost;
     private int fprimeTcPort;
-    private long uplinkIntervalMs;
     private int uplinkChunkSize;
     private int spacecraftId;
     private int vcId;
@@ -135,8 +155,6 @@ public class FprimeFilePacketService extends AbstractYamcsService implements Str
     private Bucket bucket;
 
     // Runtime — uplink
-    private Bucket outBucket;
-    private ScheduledExecutorService scheduler;
     // The two uplink transports. Exactly one is active per run depending on
     // whether uplinkLinkName resolves to a TcPacketHandler at doStart time.
     // Step 2 path: route through the YAMCS-configured TC data link.
@@ -149,10 +167,18 @@ public class FprimeFilePacketService extends AbstractYamcsService implements Str
     // Space packet sequence counter. Only used on the direct-UDP fallback
     // path; on the YAMCS-link path the FprimeCommandPostprocessor fills it.
     private int uplinkSpSeq = 0;
-    // Objects we've already attempted to upload this run. In v0 we delete
-    // successful uploads from the bucket so we never see them again; this
-    // set prevents re-uploading failed ones in a tight loop.
-    private final Set<String> uplinkFailed = new HashSet<>();
+
+    // Entity ids for the FileTransferService interface. Values are
+    // arbitrary — YAMCS only requires them to be unique within the
+    // respective local/remote sets.
+    private static final long GROUND_ENTITY_ID = 1L;
+    private static final long SPACECRAFT_ENTITY_ID = 2L;
+
+    // FileTransferService runtime state.
+    private ExecutorService uplinkExecutor;
+    private final AtomicLong transferIdSeq = new AtomicLong(1);
+    private final Map<Long, FprimeFileTransfer> transfers = new ConcurrentHashMap<>();
+    private final List<TransferMonitor> transferMonitors = new CopyOnWriteArrayList<>();
 
     // In-flight downlink transfer state. v0 supports one transfer at a time.
     // null means idle.
@@ -185,15 +211,13 @@ public class FprimeFilePacketService extends AbstractYamcsService implements Str
         Spec spec = new Spec();
         spec.addOption("inStream", OptionType.STRING).withDefault("tm_realtime");
         spec.addOption("bucket", OptionType.STRING).withDefault("fprimeFilesIn");
-        spec.addOption("outBucket", OptionType.STRING).withDefault("fprimeFilesOut");
         spec.addOption("fileApid", OptionType.INTEGER).withDefault(DEFAULT_FILE_APID);
-        // v0 step 2 default: route uplink through the YAMCS-configured TC
+        // Step 2 default: route uplink through the YAMCS-configured TC
         // data link (inherits postprocessor, link stats, transport swap).
-        // Set to empty string to force the step-1 direct-UDP fallback.
+        // Set to empty string to force the direct-UDP fallback.
         spec.addOption("uplinkLink", OptionType.STRING).withDefault("UDP_TC_OUT.vc1");
         spec.addOption("fprimeHost", OptionType.STRING).withDefault("127.0.0.1");
         spec.addOption("fprimeTcPort", OptionType.INTEGER).withDefault(50001);
-        spec.addOption("uplinkIntervalMs", OptionType.INTEGER).withDefault(2000);
         spec.addOption("uplinkChunkSize", OptionType.INTEGER).withDefault(128);
         spec.addOption("spacecraftId", OptionType.INTEGER).withDefault(68);
         spec.addOption("vcId", OptionType.INTEGER).withDefault(1);
@@ -205,20 +229,93 @@ public class FprimeFilePacketService extends AbstractYamcsService implements Str
         super.init(yamcsInstance, serviceName, config);
         this.inStreamName = config.getString("inStream", "tm_realtime");
         this.bucketName = config.getString("bucket", "fprimeFilesIn");
-        this.outBucketName = config.getString("outBucket", "fprimeFilesOut");
         this.fileApid = config.getInt("fileApid", DEFAULT_FILE_APID);
         this.uplinkLinkName = config.getString("uplinkLink", "UDP_TC_OUT.vc1");
         this.fprimeHost = config.getString("fprimeHost", "127.0.0.1");
         this.fprimeTcPort = config.getInt("fprimeTcPort", 50001);
-        this.uplinkIntervalMs = config.getLong("uplinkIntervalMs", 2000L);
         this.uplinkChunkSize = config.getInt("uplinkChunkSize", 128);
         this.spacecraftId = config.getInt("spacecraftId", 68);
         this.vcId = config.getInt("vcId", 1);
 
-        LOG.info("FprimeFilePacketService init: inStream={} bucket={} outBucket={} fileApid={}"
-                + " uplinkLink={} fprime={}:{} uplinkInterval={}ms chunk={}B scid={} vcid={}",
-                inStreamName, bucketName, outBucketName, fileApid, uplinkLinkName,
-                fprimeHost, fprimeTcPort, uplinkIntervalMs, uplinkChunkSize, spacecraftId, vcId);
+        LOG.info("FprimeFilePacketService init: inStream={} bucket={} fileApid={}"
+                + " uplinkLink={} fprime={}:{} chunk={}B scid={} vcid={}",
+                inStreamName, bucketName, fileApid, uplinkLinkName,
+                fprimeHost, fprimeTcPort, uplinkChunkSize, spacecraftId, vcId);
+    }
+
+    // ----------------------------------------------------------------------
+    // FileTransferService: capabilities, entities
+    // ----------------------------------------------------------------------
+
+    @Override
+    protected void addCapabilities(FileTransferCapabilities.Builder b) {
+        b.setUpload(true)          // operators can push files to F´
+         .setDownload(false)       // downlink is F´-initiated, not YAMCS-initiated
+         .setRemotePath(true)      // uplinks can target arbitrary F´ paths
+         .setFileList(false)       // no remote file listing
+         .setHasTransferType(false)
+         .setPauseResume(false);
+    }
+
+    @Override
+    public List<EntityInfo> getLocalEntities() {
+        return List.of(EntityInfo.newBuilder()
+                .setId(GROUND_ENTITY_ID)
+                .setName("ground")
+                .build());
+    }
+
+    @Override
+    public List<EntityInfo> getRemoteEntities() {
+        return List.of(EntityInfo.newBuilder()
+                .setId(SPACECRAFT_ENTITY_ID)
+                .setName("spacecraft")
+                .build());
+    }
+
+    // FileListingService (parent interface) — we don't support remote
+    // file listing. Capabilities.fileList is false, so the YAMCS UI will
+    // not surface listing actions, but the interface still requires these
+    // methods to be implemented.
+    @Override
+    public void saveFileList(org.yamcs.protobuf.ListFilesResponse listing) {
+        // no-op
+    }
+
+    @Override
+    public void fetchFileList(String localEntity, String remoteEntity,
+                              String remotePath, Map<String, Object> options) {
+        // no-op
+    }
+
+    @Override
+    public org.yamcs.protobuf.ListFilesResponse getFileList(String localEntity,
+            String remoteEntity, String remotePath, Map<String, Object> options) {
+        return null;
+    }
+
+    @Override
+    public void registerRemoteFileListMonitor(
+            org.yamcs.filetransfer.RemoteFileListMonitor monitor) {
+        // no-op
+    }
+
+    @Override
+    public void unregisterRemoteFileListMonitor(
+            org.yamcs.filetransfer.RemoteFileListMonitor monitor) {
+        // no-op
+    }
+
+    @Override
+    public void notifyRemoteFileListMonitors(
+            org.yamcs.protobuf.ListFilesResponse listing) {
+        // no-op
+    }
+
+    @Override
+    public java.util.Set<org.yamcs.filetransfer.RemoteFileListMonitor>
+            getRemoteFileListMonitors() {
+        return java.util.Collections.emptySet();
     }
 
     // ----------------------------------------------------------------------
@@ -238,14 +335,13 @@ public class FprimeFilePacketService extends AbstractYamcsService implements Str
 
             BucketManager bm = YamcsServer.getServer().getBucketManager();
             this.bucket = getOrCreateBucket(bm, bucketName);
-            this.outBucket = getOrCreateBucket(bm, outBucketName);
 
             this.inStream.addSubscriber(this);
 
-            // --- Uplink setup ---
-            // Prefer routing via the YAMCS-configured TC data link (step 2).
-            // Fall back to a direct UDP socket (step 1) if the link can't
-            // be resolved as a TcPacketHandler.
+            // --- Uplink transport resolution ---
+            // Prefer routing via the YAMCS-configured TC data link. Fall
+            // back to a direct UDP socket if the link can't be resolved
+            // as a TcPacketHandler.
             if (uplinkLinkName != null && !uplinkLinkName.isEmpty()) {
                 YamcsServerInstance instance = YamcsServer.getServer().getInstance(yamcsInstance);
                 Link link = instance.getLinkManager().getLink(uplinkLinkName);
@@ -267,20 +363,17 @@ public class FprimeFilePacketService extends AbstractYamcsService implements Str
                 LOG.info("Uplink will send via direct UDP to {}:{}", fprimeHost, fprimeTcPort);
             }
 
-            this.scheduler = Executors.newSingleThreadScheduledExecutor(r -> {
+            // Uplink worker: single-threaded so transfers serialize and
+            // the space packet sequence counter stays monotonic.
+            this.uplinkExecutor = Executors.newSingleThreadExecutor(r -> {
                 Thread t = new Thread(r, "FprimeFilePacketService-uplink");
                 t.setDaemon(true);
                 return t;
             });
-            this.scheduler.scheduleWithFixedDelay(
-                    this::pollOutgoingBucket,
-                    uplinkIntervalMs,
-                    uplinkIntervalMs,
-                    TimeUnit.MILLISECONDS);
 
             LOG.info("FprimeFilePacketService started: subscribed to {}, "
-                    + "polling {} every {} ms, uplink to {}:{}",
-                    inStreamName, outBucketName, uplinkIntervalMs, fprimeHost, fprimeTcPort);
+                    + "ready for file transfers via YAMCS FileTransferService API",
+                    inStreamName);
             notifyStarted();
         } catch (Exception e) {
             notifyFailed(e);
@@ -289,8 +382,8 @@ public class FprimeFilePacketService extends AbstractYamcsService implements Str
 
     @Override
     protected void doStop() {
-        if (scheduler != null) {
-            scheduler.shutdownNow();
+        if (uplinkExecutor != null) {
+            uplinkExecutor.shutdownNow();
         }
         if (uplinkSocket != null) {
             uplinkSocket.close();
@@ -483,72 +576,230 @@ public class FprimeFilePacketService extends AbstractYamcsService implements Str
     }
 
     // ----------------------------------------------------------------------
-    // UPLINK — bucket watcher, frame builder, UDP sender
-    //
-    // This half mirrors tools/l3_uplink_harness.py, which was validated
-    // bit-for-bit against the real F´ binary. Any change to the wire
-    // format should be kept in sync with that harness.
+    // FileTransferService: upload / download / transfer queries
     // ----------------------------------------------------------------------
 
-    /**
-     * Scheduled poll of the outgoing bucket. For each object present,
-     * upload it to F´ as a file and delete it on success.
-     */
-    private void pollOutgoingBucket() {
-        try {
-            List<ObjectProperties> objects = outBucket.listObjectsAsync().join();
-            for (ObjectProperties obj : objects) {
-                String name = obj.name();
-                if (uplinkFailed.contains(name)) {
-                    continue;
-                }
-                try {
-                    uplinkObject(name);
-                    outBucket.deleteObjectAsync(name).join();
-                    LOG.info("Uplink COMPLETE: {} deleted from bucket {}", name, outBucketName);
-                } catch (Exception e) {
-                    LOG.error("Uplink FAILED for {}: leaving in bucket, will not retry", name, e);
-                    uplinkFailed.add(name);
-                }
+    @Override
+    public FileTransfer startUpload(String sourceEntity, Bucket sourceBucket,
+                                    String objectName, String destinationEntity,
+                                    String remotePath, TransferOptions options)
+            throws IOException {
+        // Parameter order per YAMCS FileTransferApi.createTransfer bytecode:
+        //   (sourceEntityName, bucket, objectName, destEntityName, remotePath, options)
+        // destinationEntity is the remote entity name ("spacecraft"); the
+        // remotePath string is the actual path on the spacecraft where the
+        // file should land. Don't confuse them — an earlier pass did, and
+        // F´ ended up with a file literally named "spacecraft".
+        if (sourceBucket == null) {
+            throw new InvalidRequestException("sourceBucket is required");
+        }
+        if (objectName == null || objectName.isEmpty()) {
+            throw new InvalidRequestException("objectName is required");
+        }
+        // Fetch the bytes synchronously so we can reject early (and
+        // populate totalSize) if the object is missing. The actual
+        // transmission runs on the uplink executor.
+        byte[] content = sourceBucket.getObjectAsync(objectName).join();
+        if (content == null) {
+            throw new InvalidRequestException(
+                    "No such object '" + objectName + "' in bucket " + sourceBucket.getName());
+        }
+
+        String dest = (remotePath == null || remotePath.isEmpty())
+                ? objectName : remotePath;
+
+        FprimeFileTransfer transfer = new FprimeFileTransfer(
+                transferIdSeq.getAndIncrement(),
+                sourceBucket.getName(),
+                objectName,
+                dest,
+                content.length,
+                TransferDirection.UPLOAD);
+        transfers.put(transfer.getId(), transfer);
+        notifyStateChanged(transfer);
+
+        uplinkExecutor.submit(() -> runUplink(transfer, content));
+        return transfer;
+    }
+
+    @Override
+    public FileTransfer startDownload(String sourceEntity, String sourcePath,
+                                      String destEntity, Bucket destBucket,
+                                      String destPath, TransferOptions options) {
+        // Downlink is spacecraft-initiated: operators run F´'s
+        // FileDownlink.SendFile command from the YAMCS command stack and
+        // our tm_realtime subscriber reassembles the result. This
+        // endpoint exists for API completeness but is not implemented.
+        throw new UnsupportedOperationException(
+                "startDownload not yet implemented; issue FileDownlink.SendFile command instead");
+    }
+
+    @Override
+    public List<FileTransfer> getTransfers(FileTransferFilter filter) {
+        List<FileTransfer> all = new ArrayList<>(transfers.values());
+        if (filter == null) {
+            return all;
+        }
+        List<FileTransfer> result = new ArrayList<>();
+        for (FileTransfer ft : all) {
+            if (filter.direction != null && ft.getDirection() != filter.direction) {
+                continue;
             }
-        } catch (Exception e) {
-            LOG.error("Error polling outgoing bucket {}", outBucketName, e);
+            if (filter.states != null && !filter.states.isEmpty()
+                    && !filter.states.contains(ft.getTransferState())) {
+                continue;
+            }
+            if (filter.localEntityId != null
+                    && !filter.localEntityId.equals(ft.getLocalEntityId())) {
+                continue;
+            }
+            if (filter.remoteEntityId != null
+                    && !filter.remoteEntityId.equals(ft.getRemoteEntityId())) {
+                continue;
+            }
+            result.add(ft);
+        }
+        if (filter.limit > 0 && result.size() > filter.limit) {
+            result = result.subList(0, filter.limit);
+        }
+        return result;
+    }
+
+    @Override
+    public FileTransfer getFileTransfer(long id) {
+        return transfers.get(id);
+    }
+
+    @Override
+    public void pause(FileTransfer transfer) {
+        throw new UnsupportedOperationException("Pause not supported by Fw::FilePacket");
+    }
+
+    @Override
+    public void resume(FileTransfer transfer) {
+        throw new UnsupportedOperationException("Resume not supported by Fw::FilePacket");
+    }
+
+    @Override
+    public void cancel(FileTransfer transfer) {
+        throw new UnsupportedOperationException(
+                "Cancel not supported; Fw::FilePacket transfers are fire-and-forget");
+    }
+
+    @Override
+    public void registerTransferMonitor(TransferMonitor monitor) {
+        transferMonitors.add(monitor);
+    }
+
+    @Override
+    public void unregisterTransferMonitor(TransferMonitor monitor) {
+        transferMonitors.remove(monitor);
+    }
+
+    private void notifyStateChanged(FprimeFileTransfer transfer) {
+        for (TransferMonitor m : transferMonitors) {
+            try {
+                m.stateChanged(transfer);
+            } catch (Exception e) {
+                LOG.warn("Transfer monitor threw", e);
+            }
         }
     }
 
-    /**
-     * Upload one bucket object to F´ as a sequence of
-     * {@code Fw::FilePacket} Start + Data + End packets, each wrapped in
-     * a CCSDS space packet, each wrapped in a CCSDS TC transfer frame,
-     * each sent as a single UDP datagram.
-     *
-     * <p>The bucket object's name is used as the F´ destination path
-     * (relative to F´'s working directory). v0 does not yet support a
-     * separate source path, so the source path is set to the object
-     * name as well.
-     */
-    private void uplinkObject(String objectName) throws Exception {
-        byte[] content = outBucket.getObjectAsync(objectName).join();
-        if (content == null) {
-            throw new IllegalStateException("Object " + objectName + " vanished");
-        }
-        LOG.info("Uplink START: {} ({} bytes) -> {}:{}",
-                objectName, content.length, fprimeHost, fprimeTcPort);
+    // ----------------------------------------------------------------------
+    // Uplink state machine (runs on uplinkExecutor)
+    // ----------------------------------------------------------------------
 
-        int seq = 0;
-        // Start packet
-        sendFilePacket(buildStartPacket(seq, content.length, objectName, objectName));
+    private void runUplink(FprimeFileTransfer transfer, byte[] content) {
+        try {
+            transfer.setStartTime(System.currentTimeMillis());
+            LOG.info("Uplink START: id={} bucket={} object={} -> {} ({} bytes)",
+                    transfer.getId(), transfer.getBucketName(), transfer.getObjectName(),
+                    transfer.getRemotePath(), content.length);
 
-        // Data×N
-        for (int offset = 0; offset < content.length; offset += uplinkChunkSize) {
-            int len = Math.min(uplinkChunkSize, content.length - offset);
+            int seq = 0;
+            // Start packet
+            sendFilePacket(buildStartPacket(seq, content.length,
+                    transfer.getObjectName(), transfer.getRemotePath()));
+
+            // Data×N — update transferredSize after each chunk so the UI
+            // progress bar animates.
+            for (int offset = 0; offset < content.length; offset += uplinkChunkSize) {
+                int len = Math.min(uplinkChunkSize, content.length - offset);
+                seq++;
+                sendFilePacket(buildDataPacket(seq, offset, content, offset, len));
+                transfer.setTransferredSize(offset + len);
+                notifyStateChanged(transfer);
+            }
+
+            // End
             seq++;
-            sendFilePacket(buildDataPacket(seq, offset, content, offset, len));
+            sendFilePacket(buildEndPacket(seq, cfdpModularChecksum(content)));
+
+            transfer.setTransferredSize(content.length);
+            transfer.setState(TransferState.COMPLETED);
+            LOG.info("Uplink COMPLETE: id={} object={} ({} bytes)",
+                    transfer.getId(), transfer.getObjectName(), content.length);
+        } catch (Exception e) {
+            LOG.error("Uplink FAILED: id={} object={}",
+                    transfer.getId(), transfer.getObjectName(), e);
+            transfer.setFailureReason(e.getMessage() != null ? e.getMessage() : e.toString());
+            transfer.setState(TransferState.FAILED);
+        } finally {
+            notifyStateChanged(transfer);
+        }
+    }
+
+    // ----------------------------------------------------------------------
+    // FprimeFileTransfer — in-memory transfer state
+    // ----------------------------------------------------------------------
+
+    private static final class FprimeFileTransfer implements FileTransfer {
+        private final long id;
+        private final String bucketName;
+        private final String objectName;
+        private final String remotePath;
+        private final long totalSize;
+        private final TransferDirection direction;
+        private final long creationTime = System.currentTimeMillis();
+
+        private volatile long startTime;
+        private volatile long transferredSize;
+        private volatile TransferState state = TransferState.RUNNING;
+        private volatile String failureReason;
+
+        FprimeFileTransfer(long id, String bucketName, String objectName,
+                           String remotePath, long totalSize, TransferDirection direction) {
+            this.id = id;
+            this.bucketName = bucketName;
+            this.objectName = objectName;
+            this.remotePath = remotePath;
+            this.totalSize = totalSize;
+            this.direction = direction;
         }
 
-        // End
-        seq++;
-        sendFilePacket(buildEndPacket(seq, cfdpModularChecksum(content)));
+        @Override public long getId() { return id; }
+        @Override public String getBucketName() { return bucketName; }
+        @Override public String getObjectName() { return objectName; }
+        @Override public String getRemotePath() { return remotePath; }
+        @Override public Long getLocalEntityId() { return GROUND_ENTITY_ID; }
+        @Override public Long getRemoteEntityId() { return SPACECRAFT_ENTITY_ID; }
+        @Override public TransferDirection getDirection() { return direction; }
+        @Override public long getTotalSize() { return totalSize; }
+        @Override public long getTransferredSize() { return transferredSize; }
+        @Override public TransferState getTransferState() { return state; }
+        @Override public boolean isReliable() { return false; }  // F´ FilePacket is fire-and-forget
+        @Override public String getFailuredReason() { return failureReason; }
+        @Override public long getCreationTime() { return creationTime; }
+        @Override public long getStartTime() { return startTime; }
+        @Override public String getTransferType() { return "FwFilePacket"; }
+        @Override public boolean pausable() { return false; }
+        @Override public boolean cancellable() { return false; }
+
+        void setStartTime(long t) { this.startTime = t; }
+        void setTransferredSize(long n) { this.transferredSize = n; }
+        void setState(TransferState s) { this.state = s; }
+        void setFailureReason(String r) { this.failureReason = r; }
     }
 
     /**
