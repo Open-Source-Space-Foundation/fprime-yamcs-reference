@@ -477,35 +477,59 @@ public class FprimeFilePacketService extends AbstractFileTransferService impleme
             Event evt = (Event) body;
             String type = evt.getType();
             if (type == null) return;
+
+            // Prefer the structured `extra` map if fprime-yamcs-events
+            // populated it (patched version >= fprime-community/fprime-yamcs#PR).
+            // Fall back to regex-parsing the message string for compatibility
+            // with older fprime-yamcs-events installs that discard the arg map.
+            Map<String, String> extra = evt.getExtraMap();
+            boolean hasStructuredArgs = extra != null && !extra.isEmpty();
             String msg = evt.getMessage();
-            if (msg == null) return;
 
             try {
                 switch (type) {
                     case "DirectoryListing": {
-                        Matcher m = DIR_LISTING_RE.matcher(msg);
-                        if (m.matches()) {
-                            String dir = m.group(1);
-                            String file = m.group(2);
-                            long size = Long.parseLong(m.group(3));
-                            ListingAccumulator acc = inProgressListings.get(dir);
-                            if (acc != null) {
-                                acc.addFile(file, size);
-                            }
+                        String dir, file;
+                        long size;
+                        if (hasStructuredArgs) {
+                            dir = extra.get("dirName");
+                            file = extra.get("fileName");
+                            String sizeStr = extra.get("fileSize");
+                            if (dir == null || file == null || sizeStr == null) break;
+                            size = Long.parseLong(sizeStr);
                         } else {
-                            LOG.debug("DirectoryListing message did not match regex: {}", msg);
+                            if (msg == null) break;
+                            Matcher m = DIR_LISTING_RE.matcher(msg);
+                            if (!m.matches()) {
+                                LOG.debug("DirectoryListing message did not match regex: {}", msg);
+                                break;
+                            }
+                            dir = m.group(1);
+                            file = m.group(2);
+                            size = Long.parseLong(m.group(3));
+                        }
+                        ListingAccumulator acc = inProgressListings.get(dir);
+                        if (acc != null) {
+                            acc.addFile(file, size);
                         }
                         break;
                     }
                     case "DirectoryListingSubdir": {
-                        Matcher m = DIR_LISTING_SUBDIR_RE.matcher(msg);
-                        if (m.matches()) {
-                            String dir = m.group(1);
-                            String subdir = m.group(2);
-                            ListingAccumulator acc = inProgressListings.get(dir);
-                            if (acc != null) {
-                                acc.addSubdir(subdir);
-                            }
+                        String dir, subdir;
+                        if (hasStructuredArgs) {
+                            dir = extra.get("dirName");
+                            subdir = extra.get("subdirName");
+                            if (dir == null || subdir == null) break;
+                        } else {
+                            if (msg == null) break;
+                            Matcher m = DIR_LISTING_SUBDIR_RE.matcher(msg);
+                            if (!m.matches()) break;
+                            dir = m.group(1);
+                            subdir = m.group(2);
+                        }
+                        ListingAccumulator acc = inProgressListings.get(dir);
+                        if (acc != null) {
+                            acc.addSubdir(subdir);
                         }
                         break;
                     }
@@ -515,29 +539,34 @@ public class FprimeFilePacketService extends AbstractFileTransferService impleme
                         break;
                     }
                     case "ListDirectorySucceeded": {
-                        Matcher m = LIST_DIR_SUCCEEDED_RE.matcher(msg);
-                        if (m.matches()) {
-                            String dir = m.group(1);
-                            completeListing(dir, "completed");
+                        String dir = null;
+                        if (hasStructuredArgs) {
+                            dir = extra.get("dirName");
+                        } else if (msg != null) {
+                            Matcher m = LIST_DIR_SUCCEEDED_RE.matcher(msg);
+                            if (m.matches()) dir = m.group(1);
                         }
+                        if (dir != null) completeListing(dir, "completed");
                         break;
                     }
                     case "ListDirectoryError": {
-                        // Error messages carry the dirName as the first
-                        // argument; pull it from a minimal regex that
-                        // tolerates whatever suffix F´ adds.
-                        int dirStart = msg.indexOf("Directory ");
-                        if (dirStart >= 0) {
-                            String rest = msg.substring(dirStart + "Directory ".length());
-                            // Take up to first space/comma as the dir name.
-                            int end = rest.length();
-                            for (int i = 0; i < rest.length(); i++) {
-                                char c = rest.charAt(i);
-                                if (c == ' ' || c == ',') { end = i; break; }
+                        String dir = null;
+                        if (hasStructuredArgs) {
+                            dir = extra.get("dirName");
+                        } else if (msg != null) {
+                            // Fallback: grab the first token after "Directory ".
+                            int dirStart = msg.indexOf("Directory ");
+                            if (dirStart >= 0) {
+                                String rest = msg.substring(dirStart + "Directory ".length());
+                                int end = rest.length();
+                                for (int i = 0; i < rest.length(); i++) {
+                                    char c = rest.charAt(i);
+                                    if (c == ' ' || c == ',') { end = i; break; }
+                                }
+                                dir = rest.substring(0, end);
                             }
-                            String dir = rest.substring(0, end);
-                            completeListing(dir, "failed");
                         }
+                        if (dir != null) completeListing(dir, "failed");
                         break;
                     }
                     default:
