@@ -33,6 +33,8 @@ import org.yamcs.YamcsServer;
 import org.yamcs.YamcsServerInstance;
 import org.yamcs.buckets.Bucket;
 import org.yamcs.buckets.BucketManager;
+import org.yamcs.cmdhistory.CommandHistoryPublisher;
+import org.yamcs.cmdhistory.CommandHistoryPublisher.AckStatus;
 import org.yamcs.commanding.CommandingManager;
 import org.yamcs.commanding.PreparedCommand;
 import org.yamcs.filetransfer.AbstractFileTransferService;
@@ -210,9 +212,16 @@ public class FprimeFilePacketService extends AbstractFileTransferService impleme
     // Resolved at doStart for downlink command synthesis.
     private Processor processor;
     private CommandingManager commandingManager;
+    private CommandHistoryPublisher commandHistoryPublisher;
     private MetaCommand fileDownlinkCommand;  // may be null if not in MDB
     private MetaCommand listDirectoryCommand; // may be null if not in MDB
     private User systemUser;
+
+    // Custom verifier key reported back to YAMCS command history so
+    // operators see the transfer outcome on the SendFile command entry
+    // in the command stack. Appears as Verifier_FileTransfer_Status etc.
+    private static final String VERIFIER_KEY =
+            CommandHistoryPublisher.Verifier_KEY_PREFIX + "FileTransfer";
 
     // Remote file listing state. Inspired by CFDP's approach: keep an
     // in-progress accumulator per directory, flip to fileListCache on
@@ -704,6 +713,7 @@ public class FprimeFilePacketService extends AbstractFileTransferService impleme
             this.processor = ysi.getFirstProcessor();
             if (processor != null) {
                 this.commandingManager = processor.getCommandingManager();
+                this.commandHistoryPublisher = processor.getCommandHistoryPublisher();
                 this.fileDownlinkCommand = processor.getMdb().getMetaCommand(fileDownlinkCommandName);
                 this.listDirectoryCommand = processor.getMdb().getMetaCommand(listDirectoryCommandName);
                 this.systemUser = YamcsServer.getServer().getSecurityStore().getSystemUser();
@@ -793,12 +803,13 @@ public class FprimeFilePacketService extends AbstractFileTransferService impleme
             LOG.warn("Download timeout: id={} remotePath={} after {} ms — "
                     + "no Start packet received",
                     t.getId(), t.getRemotePath(), age);
-            t.setFailureReason(
-                    "timeout after " + age + " ms: F´ did not emit a Start "
+            String reason = "timeout after " + age + " ms: F´ did not emit a Start "
                     + "packet for '" + t.getRemotePath() + "' "
-                    + "(command rejected? file missing? link down?)");
+                    + "(command rejected? file missing? link down?)";
+            t.setFailureReason(reason);
             t.setState(TransferState.FAILED);
             notifyStateChanged(t);
+            publishVerifierAck(t, AckStatus.TIMEOUT, reason);
         }
     }
 
@@ -919,6 +930,8 @@ public class FprimeFilePacketService extends AbstractFileTransferService impleme
         api.setState(TransferState.RUNNING);
         inflight.apiTransfer = api;
         notifyStateChanged(api);
+        publishVerifierAck(api, AckStatus.PENDING,
+                String.format("receiving %d bytes from %s", fileSize, src));
     }
 
     private void handleData(byte[] bytes, int offset, int seqIndex) {
@@ -985,6 +998,9 @@ public class FprimeFilePacketService extends AbstractFileTransferService impleme
                 inflight.apiTransfer.setTransferredSize(inflight.bytesReceived);
                 inflight.apiTransfer.setState(TransferState.COMPLETED);
                 notifyStateChanged(inflight.apiTransfer);
+                publishVerifierAck(inflight.apiTransfer, AckStatus.OK,
+                        String.format("delivered %d bytes to bucket %s/%s",
+                                inflight.bytesReceived, bucketName, objectName));
             }
         } catch (Exception e) {
             LOG.error("Failed to store file in bucket", e);
@@ -1018,6 +1034,7 @@ public class FprimeFilePacketService extends AbstractFileTransferService impleme
             inflight.apiTransfer.setFailureReason(reason);
             inflight.apiTransfer.setState(TransferState.FAILED);
             notifyStateChanged(inflight.apiTransfer);
+            publishVerifierAck(inflight.apiTransfer, AckStatus.NOK, reason);
         }
         inflight = null;
     }
@@ -1147,7 +1164,13 @@ public class FprimeFilePacketService extends AbstractFileTransferService impleme
                     "FprimeFilePacketService",
                     (int) (id & 0x7FFFFFFF),
                     systemUser);
+            // Remember the CommandId so we can publish verifier acks
+            // against this command's history entry as the transfer
+            // progresses through RUNNING -> COMPLETED/FAILED.
+            transfer.setTriggeringCommandId(pc.getCommandId());
             commandingManager.sendCommand(systemUser, pc);
+            publishVerifierAck(transfer, AckStatus.SCHEDULED,
+                    "waiting for spacecraft Start packet");
             LOG.info("Downlink START: id={} source={} (on F´) -> bucket {}/{}",
                     id, sourcePath, destBucket.getName(), destPath);
         } catch (Exception e) {
@@ -1158,6 +1181,8 @@ public class FprimeFilePacketService extends AbstractFileTransferService impleme
             transfer.setFailureReason("command dispatch: " + e.getMessage());
             transfer.setState(TransferState.FAILED);
             notifyStateChanged(transfer);
+            publishVerifierAck(transfer, AckStatus.NOK,
+                    "command dispatch failed: " + e.getMessage());
             throw new IOException("Failed to dispatch downlink command", e);
         }
 
@@ -1236,6 +1261,29 @@ public class FprimeFilePacketService extends AbstractFileTransferService impleme
         }
     }
 
+    /**
+     * Publish a verifier ack to the YAMCS command history entry for the
+     * command that triggered this transfer, so operators drilling into
+     * the command stack see the transfer's progress alongside the
+     * standard CCSDS/release acks.
+     *
+     * <p>No-op if the transfer wasn't triggered by a synthesized command
+     * (uplinks don't have a triggering command; command-stack-initiated
+     * downlinks reach us without a CommandId handle we can update).
+     */
+    private void publishVerifierAck(FprimeFileTransfer transfer, AckStatus status, String message) {
+        if (commandHistoryPublisher == null) return;
+        CommandId cmdId = transfer.getTriggeringCommandId();
+        if (cmdId == null) return;
+        try {
+            commandHistoryPublisher.publishAck(cmdId, VERIFIER_KEY,
+                    System.currentTimeMillis(), status, message);
+        } catch (Exception e) {
+            LOG.debug("Failed to publish verifier ack for transfer {}",
+                    transfer.getId(), e);
+        }
+    }
+
     // ----------------------------------------------------------------------
     // Uplink state machine (runs on uplinkExecutor)
     // ----------------------------------------------------------------------
@@ -1297,6 +1345,13 @@ public class FprimeFilePacketService extends AbstractFileTransferService impleme
         private volatile long transferredSize;
         private volatile TransferState state = TransferState.RUNNING;
         private volatile String failureReason;
+        // For downlink transfers triggered via startDownload(), this is
+        // the CommandId of the synthesized FileDownlink.SendFile command.
+        // We publish verification results against this CommandId so
+        // operators see the transfer outcome in the command stack.
+        // Null for uplinks (no triggering command) and for unsolicited
+        // downlinks (command stack issued directly).
+        private volatile CommandId triggeringCommandId;
 
         FprimeFileTransfer(long id, String bucketName, String objectName,
                            String remotePath, long totalSize, TransferDirection direction) {
@@ -1331,6 +1386,8 @@ public class FprimeFilePacketService extends AbstractFileTransferService impleme
         void setTotalSize(long n) { this.totalSize = n; }
         void setState(TransferState s) { this.state = s; }
         void setFailureReason(String r) { this.failureReason = r; }
+        void setTriggeringCommandId(CommandId id) { this.triggeringCommandId = id; }
+        CommandId getTriggeringCommandId() { return triggeringCommandId; }
     }
 
     /**
