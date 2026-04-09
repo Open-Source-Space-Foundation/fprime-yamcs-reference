@@ -22,3 +22,5 @@ __pycache__/
 /tools/fprime_filepacket/oracle/dump_vectors
 # Maven build output
 /FprimeYamcsReference/yamcs/target/
+# Uplink test artifacts written to repo root by F´ cwd
+/uplinked_test.txt
