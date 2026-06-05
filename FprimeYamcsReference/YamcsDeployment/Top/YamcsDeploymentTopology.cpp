@@ -10,6 +10,7 @@
 
 // Necessary project-specified types
 #include <Fw/Types/MallocAllocator.hpp>
+#include <cstring>
 
 // Public functions for use in main program are namespaced with deployment module FprimeYamcsReference
 // This is also the namespace where the topology components are instantiated by FPP.
@@ -63,8 +64,12 @@ void setupTopology(const TopologyState& state) {
     // Autocoded configuration. Function provided by autocoder.
     configComponents(state);
     if (state.hostname != nullptr && state.port != 0) {
-        comDriver.configureSend(state.hostname, state.port);
-        comDriver.configureRecv(state.hostname, state.port + 1);
+        const char* hostname = state.hostname;
+        if (Fw::String(hostname) == Fw::String("0.0.0.0")) {
+            hostname = "127.0.0.1";
+        }
+        comDriver.configureSend(hostname, state.port);
+        comDriver.configureRecv(hostname, state.port + 1);
     }
     // Project-specific component configuration. Function provided above. May be inlined, if desired.
     configureTopology();
